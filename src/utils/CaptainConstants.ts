@@ -32,6 +32,8 @@ const CONSTANT_FILE_OVERRIDE_USER =
 const configs = {
     publishedNameOnDockerHub: getReleaseConfigValue('CAPROVER_IMAGE_NAME'),
 
+    captainServiceName: 'captain-captain' as string,
+
     version: getReleaseConfigValue('CAPROVER_VERSION'),
 
     defaultMaxLogSize: '512m',
@@ -196,7 +198,9 @@ const data = {
 
     nginxServiceName: 'captain-nginx',
 
-    captainServiceName: 'captain-captain',
+    get captainServiceName(): string {
+        return configs.captainServiceName || 'captain-captain'
+    },
 
     certbotServiceName: 'captain-certbot',
 
