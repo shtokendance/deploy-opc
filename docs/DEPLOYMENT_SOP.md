@@ -1,83 +1,97 @@
-# deploy-opc 生产环境标准部署与运维操作手册 (SOP)
+# deploy-opc 生产环境标准构建部署与运维操作手册 (SOP)
 
-> **版本**：v1.16.0  
-> **更新时间**：2026-11-13  
-> **适用环境**：OPC-2.0 企业生产环境 (Production)
+> **适用场景**：OPC-2.0 企业生产环境 (Production)  
+> **核心原则**：线上环境直接拉取 Git `release` 分支代码，使用 Dockerfile 容器化编译，以 `release` 分支的 Commit 短哈希（7位）作为镜像版本号进行统一交付与部署。
 
 ---
 
-## 1. 统一命名与架构规范
+## 1. 统一命名与版本规范
 
-为避免生产环境中混用开源默认命名造成认知混乱与管理成本，生产环境全面推行 **`deploy-opc` 统一命名规范**：
+为了实现生产环境全生命周期的可追溯性（1:1 锚定代码提交），全面推行以下命名规范：
 
-| 交付维度 | 统一命名 | 作用与定位 |
+| 交付维度 | 命名规范 | 示例与说明 |
 | :--- | :--- | :--- |
-| **制品名称** | **`deploy-opc.tar.gz`** | 包含后端编译产物 `built/`、前端静态资源 `dist-frontend/` 及生产依赖的完整发布压缩包 |
-| **镜像名称** | **`deploy-opc:1.16.0`**<br>`deploy-opc:latest` | 生产标准 Docker 镜像，基于 Node.js 24 + 底层安全工具多阶段构建 |
-| **引导容器名** | **`deploy-opc-bootstrap`** | 首次安装时运行的一次性初始化引导容器 |
-| **Swarm 服务名**| **`deploy-opc`** | Docker Swarm 中负责应用调度、版本管理的核心管理常驻服务 |
-| **数据库专属库**| **`deploy-opc`** | PostgreSQL 中存储已部署应用、构建版本、基础设施资源的专属数据库 |
+| **镜像名称与版本** | **`deploy-opc:<short-commit>`**<br>`deploy-opc:latest` | 使用 `release` 分支最新 **7位 Commit Hash** 作为版本号，如 **`deploy-opc:5b4f35f`** |
+| **Swarm 服务名** | **`deploy-opc`** | Docker Swarm 中负责应用生命周期管控的核心常驻服务 |
+| **引导容器名** | **`deploy-opc-bootstrap`** | 首次部署初始化集群时运行的一次性引导容器 |
+| **数据库专属库** | **`deploy-opc`** | PostgreSQL 中存储已部署应用、发布版本、基础设施资源的专属数据库 |
 
 ---
 
-## 2. 核心架构与通信链路
+## 2. 核心架构与运行模型
 
 ```
-                             [ 客户端 / 浏览器 / 运维人员 ]
-                                          │
-                   ┌──────────────────────┴──────────────────────┐
-                   │                                             │
-      HTTP/HTTPS 业务应用流量 (80/443)              管理后台与 REST API (13000)
-                   │                                             │
-                   ▼                                             ▼
-       [ captain-nginx 网关 ]                        [ deploy-opc 核心调度引擎 ]
-                   │                                             │
-                   │ (内部 Overlay 网络路由)                       │ (Docker Socket /var/run/docker.sock)
-                   ▼                                             ▼
-     [ 托管应用：supplier / smart-expense ] ◄────────── [ 容器伸缩 / 滚动更新 / 日志审计 ]
-                                                                 ▲
-                                                                 │ HTTP API (13000)
-                                                    [ platform-opc 业务管控网关 ]
-                                                                 │
-                                                                 ▼
-                                                    [ PostgreSQL: deploy-opc 库 ]
+[ 线上正式服务器 (宿主机) ]
+  ├── 1. Git 仓库 (本地目录: /opt/opc/deploy-opc)
+  │      └── release 分支 -> 提取最新 Commit Hash (例如: 5b4f35f)
+  │
+  ├── 2. 容器化编译与打包 (docs/Dockerfile)
+  │      ├── Stage 1: 工具镜像提取 (openssl, curl, git, CA 证书)
+  │      ├── Stage 2: Node.js 24 容器内执行 npm ci & npm run build 编译
+  │      └── Stage 3: 输出最终精简镜像 -> deploy-opc:5b4f35f
+  │
+  ├── 3. Docker Swarm 核心服务 (captain-overlay-network)
+  │      ├── deploy-opc 服务 (镜像: deploy-opc:5b4f35f，映射端口 13000)
+  │      ├── captain-nginx 动态网关 (监听 80/443)
+  │      └── 托管业务容器 (如 supplier, smart-expense 等)
+  │
+  └── 4. 宿主机持久化目录 (/captain)
+         ├── /captain/data/config-override.json (生产参数覆盖配置)
+         ├── /captain/data/config-captain.json (系统状态数据库)
+         └── /captain/data/dist-frontend (控制台前端静态资源)
 ```
 
 ---
 
-## 3. 编译机制与输出制品
+## 3. 核心 Dockerfile 设计（纯容器化编译）
 
-### 3.1 编译执行命令
-在本地开发机或 CI 流水线中执行：
-```bash
-cd deploy-opc
-npm run build
+生产标准 Dockerfile（位于 [docs/Dockerfile](file:///Users/sheep.yang/Documents/OPC-2.0/deploy-opc/docs/Dockerfile)）采用三阶段构建，**宿主机无需预装 Node.js 或 npm**，所有源码编译全部在独立容器沙箱中完成：
+
+```dockerfile
+# 第一阶段：提取底层系统工具与根证书
+FROM golang:1.26-bookworm AS tools
+
+# 第二阶段：构建阶段，在 Node.js 容器内安全编译
+FROM node:24-bookworm-slim AS builder
+WORKDIR /usr/src/app
+COPY package*.json tsconfig.json ./
+RUN npm ci
+COPY src/ ./src/
+COPY template/ ./template/
+COPY public/ ./public/
+COPY release/ ./release/
+COPY scripts/ ./scripts/
+RUN npm run build
+
+# 第三阶段：生产运行镜像，最小化安全封装
+FROM node:24-bookworm-slim
+COPY --from=tools /usr/bin/openssl /usr/bin/openssl
+COPY --from=tools /usr/bin/curl /usr/bin/curl
+COPY --from=tools /usr/bin/git /usr/bin/git
+COPY --from=tools /etc/ssl /etc/ssl
+COPY --from=tools /usr/share/ca-certificates /usr/share/ca-certificates
+
+WORKDIR /usr/src/app
+COPY --from=builder /usr/src/app/package*.json ./
+COPY --from=builder /usr/src/app/node_modules ./node_modules
+COPY --from=builder /usr/src/app/built ./built
+COPY --from=builder /usr/src/app/template ./template
+COPY --from=builder /usr/src/app/public ./public
+COPY --from=builder /usr/src/app/release ./release
+COPY --from=builder /usr/src/app/scripts ./scripts
+COPY . /usr/src/app
+
+ENV NODE_ENV=production PORT=3000
+EXPOSE 3000
+CMD ["node", "./built/server.js"]
 ```
-
-### 3.2 编译底层逻辑
-- **循环依赖校验**：通过 `madge` 扫描源码确保无循环引用。
-- **TypeScript 转译**：调用 `tsc` 读取 `tsconfig.json`，将 `src/` 转译为 CommonJS 规范的纯 JavaScript 并输出到 `./built/` 目录。
-- **输出产物清单**：
-  - `./built/server.js`：服务启动引导入口。
-  - `./built/app.js`：Express 路由定义与静态资源托管逻辑。
-  - `./built/docker/`：底层 Swarm 节点调度与容器生命周期管控。
-  - `./built/user/`：鉴权、配置持久化、版本管理及负载均衡。
-
-### 3.3 一键打包生成统一制品
-使用项目内置的打包脚本：
-```bash
-chmod +x docs/package.sh
-./docs/package.sh
-```
-执行完毕后，将在 `/tmp/` 生成标准交付制品：**`/tmp/deploy-opc.tar.gz`**。
 
 ---
 
-## 4. 全量配置解析（配置文件与环境变量）
+## 4. 全量配置参数解析
 
-### 4.1 宿主机覆盖配置：`/captain/data/config-override.json`
-该文件放置在宿主机数据目录中，服务启动时具有**最高优先级**：
-
+### 4.1 宿主机覆盖配置文件：`/captain/data/config-override.json`
+在宿主机准备好此文件，服务启动时将自动生效：
 ```json
 {
   "captainServiceName": "deploy-opc",
@@ -91,62 +105,79 @@ chmod +x docs/package.sh
 }
 ```
 
-| 参数名 | 生产推荐值 | 详细含义与说明 |
+| 参数名 | 生产取值 | 说明 |
 | :--- | :--- | :--- |
 | **`captainServiceName`** | `"deploy-opc"` | **服务统一命名**：将 Swarm 服务名固定为 `deploy-opc` |
 | **`publishedNameOnDockerHub`** | `"deploy-opc"` | **镜像统一命名**：默认使用的镜像标识 |
-| **`adminPortNumber3000`** | `13000` | 管理控制台与调度 API 在宿主机映射的端口（避开 3000） |
-| **`nginxPortNumber80`** | `80` | 动态反向代理对外开放的 HTTP 业务端口 |
-| **`nginxPortNumber443`** | `443` | 动态反向代理对外开放的 HTTPS 业务端口 |
-| **`skipVerifyingDomains`** | `"true"` / `"false"`| 纯内网或无公网 DNS 时设为 `"true"`；公网真实域名解析设为 `"false"` |
-| **`useExistingSwarm`** | `"true"` | 复用已手动初始化的 Docker Swarm，严禁自动重复初始化 |
-| **`defaultDockerBuildVersion`** | `"2"` | 强制使用 BuildKit 现代化构建引擎 |
-
----
-
-### 4.2 容器环境变量说明
-
-#### (1) 引导容器 (`deploy-opc-bootstrap`) 阶段：
-- **`ACCEPTED_TERMS=true`**：必须显式同意许可协议。
-- **`MAIN_NODE_IP_ADDRESS=<内网IP>`**：主管理节点在内网通信的 IP 地址。
-- **`BY_PASS_PROXY_CHECK=true`**：绕过引导时的外网端口自检（针对 VPC 内网环境）。
-
-#### (2) 常驻集群服务 (`deploy-opc`) 阶段：
-- **`IS_CAPTAIN_INSTANCE=1`**：由引导程序自动注入，指示容器作为 Swarm 服务主控运行。
-- **`NODE_ENV=production`**：生产运行模式。
-- **`PORT=3000`**：容器内部 Express 监听端口。
+| **`adminPortNumber3000`** | `13000` | 管理控制台与调度 API 在宿主机映射的端口（避免与默认 3000 冲突） |
+| **`nginxPortNumber80`** | `80` | 对外业务 HTTP 端口（如果宿主机 80 被占用可设为 `8080`） |
+| **`nginxPortNumber443`** | `443` | 对外业务 HTTPS 端口 |
+| **`skipVerifyingDomains`** | `"true"` / `"false"` | 内网/无外网 DNS 解析时设为 `"true"`；公网真实泛域名可设为 `"false"` |
+| **`useExistingSwarm`** | `"true"` | 强制复用人工初始化好的 Swarm 集群，防止网段冲突 |
+| **`defaultDockerBuildVersion`** | `"2"` | 启用 BuildKit 高性能镜像构建引擎 |
 
 ---
 
 ## 5. 正式环境实操落地步骤 (SOP)
 
-### 步骤 1：目标服务器环境确认与 Swarm 初始化
-登录到正式环境目标宿主机：
+---
+
+### 步骤 1：在线拉取代码与检出 `release` 分支
+在正式服务器（推荐安装目录如 `/opt/opc/deploy-opc`）拉取最新代码：
 ```bash
-# 1. 确认 Docker 已经安装并正常运行
-docker --version
+# 1. 首次克隆仓库（若已克隆直接进入目录即可）
+sudo mkdir -p /opt/opc
+cd /opt/opc
+sudo git clone https://github.com/Roger0808/deploy-opc.git
+cd deploy-opc
 
-# 2. 获取宿主机内网真实网卡 IP（例如 10.101.102.116）
-PROD_IP="$(ip route get 1.1.1.1 | awk '{print $7; exit}')"
-
-# 3. 初始化 Docker Swarm 并严格隔离 Overlay 网段（防止与公司局域网 CIDR 冲突）
-sudo docker swarm init \
-  --advertise-addr "$PROD_IP" \
-  --default-addr-pool 10.12.0.0/16 \
-  --default-addr-pool-mask-length 24
-
-# 4. 确认集群状态为 active
-sudo docker info --format 'Swarm: {{.Swarm.LocalNodeState}} | Manager: {{.Swarm.ControlAvailable}}'
+# 2. 检出并同步最新 release 分支
+sudo git fetch origin release
+sudo git checkout release
+sudo git pull origin release
 ```
 
 ---
 
-### 步骤 2：创建持久化目录与写入生产配置
+### 步骤 2：提取 Commit Hash 并确认镜像版本号
+```bash
+# 提取 release 分支最新的 7 位 short commit hash
+COMMIT_SHA=$(git rev-parse --short=7 HEAD)
+IMAGE_TAG="deploy-opc:${COMMIT_SHA}"
+
+echo "=========================================================="
+echo "当前 release 分支 Commit: $COMMIT_SHA"
+echo "目标生产镜像版本: $IMAGE_TAG"
+echo "=========================================================="
+```
+
+---
+
+### 步骤 3：服务器系统与 Docker Swarm 初始化
+```bash
+# 1. 确认已安装 Docker 25+
+docker --version
+
+# 2. 获取宿主机内网通信网卡 IP
+PROD_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || hostname -I | awk '{print $1}')"
+
+# 3. 初始化 Docker Swarm（必须自定义 Overlay 地址池，彻底规避 10.x 企业内网冲突）
+if [ "$(sudo docker info --format '{{.Swarm.LocalNodeState}}')" != "active" ]; then
+    sudo docker swarm init \
+      --advertise-addr "$PROD_IP" \
+      --default-addr-pool 10.12.0.0/16 \
+      --default-addr-pool-mask-length 24
+fi
+```
+
+---
+
+### 步骤 4：宿主机持久化目录与配置注入
 ```bash
 # 1. 创建基础数据目录
 sudo mkdir -p /captain/data /captain/generated /captain/temp
 
-# 2. 写入统一命名的生产配置文件
+# 2. 注入生产配置文件
 sudo tee /captain/data/config-override.json << 'EOF'
 {
   "captainServiceName": "deploy-opc",
@@ -163,41 +194,33 @@ EOF
 
 ---
 
-### 步骤 3：准备前端控制台静态资源
-由于前端单页控制台是独立的预编译产物，首次部署需放置到 `/captain/data/dist-frontend`：
+### 步骤 5：同步前端控制台静态资源
+若前端包位于测试机或预发机器，执行一次性同步至宿主机：
 ```bash
-# 如果从测试机同步现有静态包：
-scp -r ecs-user@<TEST_IP>:/captain/data/dist-frontend /tmp/
-sudo cp -r /tmp/dist-frontend /captain/data/dist-frontend
+# 从测试服务器同步控制台静态文件
+sudo scp -r ecs-user@10.101.102.116:/captain/data/dist-frontend /captain/data/
+# 同时同步一份到当前源码目录
+sudo cp -r /captain/data/dist-frontend ./dist-frontend
 ```
 
 ---
 
-### 步骤 4：解压制品并构建统一镜像 `deploy-opc:1.16.0`
-将打包好的制品 `/tmp/deploy-opc.tar.gz` 上传至正式服务器，并执行：
+### 步骤 6：基于 Dockerfile 编译并打包最终镜像
+直接使用 `docs/Dockerfile` 执行编译（所有构建在 Docker 内部执行）：
 ```bash
-# 1. 准备构建工作目录
-sudo rm -rf /data/build/deploy-opc
-sudo mkdir -p /data/build/deploy-opc
-sudo tar -xzf /tmp/deploy-opc.tar.gz -C /data/build/deploy-opc
-
-# 2. 将前端资源同步至构建上下文
-sudo cp -r /captain/data/dist-frontend /data/build/deploy-opc/dist-frontend
-
-# 3. 构建统一生产镜像
-cd /data/build/deploy-opc
-sudo sed -i "/^\/node_modules/d; /^\/built/d" .dockerignore 2>/dev/null || true
-
-sudo docker build -f Dockerfile.caprover \
-  -t deploy-opc:1.16.0 \
-  -t deploy-opc:latest .
+sudo docker build \
+  -f docs/Dockerfile \
+  -t "deploy-opc:${COMMIT_SHA}" \
+  -t "deploy-opc:latest" \
+  .
 ```
 
 ---
 
-### 步骤 5：启动引导程序并生成集群服务
+### 步骤 7：拉起服务（首次安装 vs 滚动更新）
+
+#### 选项 A：首次全新安装（运行一次性引导容器）
 ```bash
-# 1. 运行一次性安装引导容器
 sudo docker run -d \
   --name deploy-opc-bootstrap \
   -p 80:80 -p 443:443 -p 13000:3000 \
@@ -206,70 +229,62 @@ sudo docker run -d \
   -e ACCEPTED_TERMS=true \
   -e MAIN_NODE_IP_ADDRESS="$PROD_IP" \
   -e BY_PASS_PROXY_CHECK=true \
-  deploy-opc:1.16.0
+  "deploy-opc:${COMMIT_SHA}"
 
-# 2. 观察初始化日志（直到出现 "Captain is initialized and ready to serve you!"）
+# 观察引导完成提示 "Captain is initialized and ready"
 sudo docker logs -f deploy-opc-bootstrap
 
-# 3. 清理临时引导容器
+# 移除临时引导容器
 sudo docker rm -f deploy-opc-bootstrap
 ```
 
----
-
-### 步骤 6：验证 Swarm 服务运行状态
+#### 选项 B：已有集群更新发布（零停机滚动更新）
+若服务器上已存在 `deploy-opc` 服务，直接执行平滑升级：
 ```bash
-sudo docker service ls
+sudo docker service update --force --image "deploy-opc:${COMMIT_SHA}" deploy-opc
 ```
-正常应看到：
-- **`deploy-opc`**（核心服务，Replicas: `1/1`）
-- **`captain-nginx`**（反向代理网关，Replicas: `1/1`）
-- **`captain-certbot`**（证书自动化，Replicas: `1/1`）
 
 ---
 
-### 步骤 7：生产安全加固与配置
-1. **修改管理员密码**：
-   - 浏览器打开 `http://<PROD_IP>:13000`；
+### 步骤 8：检查服务状态与验证
+```bash
+# 1. 查看 Swarm 服务列表与运行镜像版本
+sudo docker service ls
+sudo docker service ps deploy-opc
+
+# 2. 健康检查验证
+curl -I http://127.0.0.1:13000/
+# 预期返回: HTTP/1.1 200 OK
+```
+
+---
+
+### 步骤 9：安全加固与平台网关 (`platform-opc`) 联动
+1. **修改控制台初始密码**：
+   - 访问 `http://<PROD_IP>:13000`；
    - 默认密码为 **`captain42`**；
-   - 登录后立即在 **Settings** -> **Change Password** 修改为企业高强密码，并妥善保管。
-2. **绑定企业泛域名**：
-   - 将企业 DNS 泛解析 `*.apps.yourcompany.com` 指向服务器 IP；
-   - 在控制台 **Settings** -> **Root Domain** 输入 `apps.yourcompany.com` 完成连接，并在页面开启 HTTPS。
-
----
-
-### 步骤 8：配置平台网关联动 (`platform-opc`)
-1. **在 PostgreSQL 中创建专属库**：
+   - 登录后在 **Settings** -> **Change Password** 修改为强密码（如 `<PROD_STRONG_PASS>`）。
+2. **在 PostgreSQL 中创建专属库**：
    ```sql
    CREATE DATABASE "deploy-opc" OWNER opc_platform;
    GRANT ALL PRIVILEGES ON DATABASE "deploy-opc" TO opc_platform;
    ```
-2. **在 `platform-opc` 环境变量中注入对接参数**：
+3. **在 `platform-opc` 配置环境变量**：
    ```yaml
    APP_DEPLOY_CAPROVER_URL: "http://<PROD_IP>:13000"
-   APP_DEPLOY_CAPROVER_PASSWORD: "<步骤7中设置的强密码>"
+   APP_DEPLOY_CAPROVER_PASSWORD: "<PROD_STRONG_PASS>"
    APP_DEPLOY_INTRANET_ROOT_DOMAIN: "apps.yourcompany.com"
    ```
 
 ---
 
-## 6. 日常运维与平滑升级（Day-2 Operations）
+## 6. 一键自动化流水线（后续日常运维）
 
-### 6.1 后续代码平滑升级（零停机）
-当 `deploy-opc` 有代码更新需要上线正式环境时，执行滚动升级即可：
+为了让日常升级更简便，已在项目内提供了一键式自动化部署脚本 [docs/deploy.sh](file:///Users/sheep.yang/Documents/OPC-2.0/deploy-opc/docs/deploy.sh)。
+
+后续当 `release` 分支有代码更新时，在正式服务器上只需执行：
 ```bash
-# 1. 重新构建新版本镜像 (如 1.16.1)
-sudo docker build -f Dockerfile.caprover -t deploy-opc:1.16.1 -t deploy-opc:latest /data/build/deploy-opc
-
-# 2. 直接对 Swarm 服务执行平滑滚动更新
-sudo docker service update --force --image deploy-opc:1.16.1 deploy-opc
-
-# 3. 观察更新状态
-sudo docker service ps deploy-opc
+cd /opt/opc/deploy-opc
+sudo bash docs/deploy.sh
 ```
-
-### 6.2 数据灾备与恢复
-正式环境的全部配置与历史元数据均保存在宿主机的 **`/captain`** 目录下。
-- **备份建议**：每日通过定时任务打包备份 `/captain/data` 目录（尤其是 `config-captain.json`）。
-- **恢复方式**：在新机器上还原 `/captain/data` 目录后直接执行步骤 5，即可 100% 无损恢复整个集群所有应用。
+该脚本将**自动拉取最新 release 代码、自动提取 7 位 Commit Hash、自动调用 Dockerfile 容器化编译并平滑滚动更新集群服务**。
