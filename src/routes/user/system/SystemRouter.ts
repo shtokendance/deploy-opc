@@ -9,6 +9,7 @@ import DockerUtils from '../../../docker/DockerUtils'
 import InjectionExtractor from '../../../injection/InjectionExtractor'
 import { IAppDef } from '../../../models/AppDefinition'
 import { AutomatedCleanupConfigsCleaner } from '../../../models/AutomatedCleanupConfigs'
+import { prepareApplicationVolumePath } from '../../../user/system/ApplicationVolumePaths'
 import CaptainManager from '../../../user/system/CaptainManager'
 import VersionManager from '../../../user/system/VersionManager'
 import CaptainConstants from '../../../utils/CaptainConstants'
@@ -243,6 +244,62 @@ router.get('/application-storage/', function (req, res, next) {
             res.send(response)
         })
         .catch(ApiStatusCodes.createCatcher(res))
+})
+
+router.post('/application-storage/paths/', function (req, res) {
+    const { root, backend, node_id, directory, create } = req.body || {}
+    if (
+        typeof root !== 'string' ||
+        root.length > 255 ||
+        (backend !== 'local-directory' && backend !== 'aliyun-oss-volume') ||
+        typeof node_id !== 'string' ||
+        typeof directory !== 'string' ||
+        typeof create !== 'boolean' ||
+        (create && !directory)
+    ) {
+        res.send(
+            new BaseApi(
+                ApiStatusCodes.STATUS_ERROR_GENERIC,
+                'Invalid storage path request'
+            )
+        )
+        return
+    }
+    Promise.resolve()
+        .then(function () {
+            if (node_id !== CaptainManager.get().getMyNodeId()) {
+                throw new Error(
+                    'Storage node does not match the active Deploy node'
+                )
+            }
+            return DockerApi.get().getServiceMounts(
+                CaptainConstants.captainServiceName
+            )
+        })
+        .then(function (mounts) {
+            return prepareApplicationVolumePath(
+                root,
+                backend,
+                directory,
+                create,
+                mounts
+            )
+        })
+        .then(function () {
+            res.send(
+                new BaseApi(
+                    ApiStatusCodes.STATUS_OK,
+                    'Application storage path ready'
+                )
+            )
+        })
+        .catch(function (error: Error) {
+            const message =
+                'code' in error
+                    ? 'Storage path is missing or inaccessible on the Deploy node'
+                    : error.message
+            res.send(new BaseApi(ApiStatusCodes.STATUS_ERROR_GENERIC, message))
+        })
 })
 
 router.get('/diskusage/', function (req, res, next) {

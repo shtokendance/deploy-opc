@@ -10,7 +10,7 @@ import {
 } from '../models/AppDefinition'
 import { DockerAuthObj, DockerRegistryConfig } from '../models/DockerAuthObj'
 import { DockerSecret } from '../models/DockerSecret'
-import DockerService from '../models/DockerService'
+import DockerService, { Mount } from '../models/DockerService'
 import {
     DockerBuildOutputDecoder,
     DockerJsonMessage,
@@ -233,6 +233,11 @@ class DockerApi {
             .then(function (services) {
                 return (services || []) as unknown as DockerService[]
             })
+    }
+
+    async getServiceMounts(serviceName: string): Promise<Mount[]> {
+        const service = await this.dockerode.getService(serviceName).inspect()
+        return service.Spec.TaskTemplate.ContainerSpec?.Mounts || []
     }
 
     async getVolumeUsage() {
