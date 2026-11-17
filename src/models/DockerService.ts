@@ -10,6 +10,7 @@ export interface Mount {
     Type: string
     Source: string
     Target: string
+    ReadOnly?: boolean
 }
 
 export interface ContainerSpecType {
