@@ -246,6 +246,30 @@ router.get('/application-storage/', function (req, res, next) {
         .catch(ApiStatusCodes.createCatcher(res))
 })
 
+router.get('/application-storage/paths/:appName', function (req, res) {
+    const appName = req.params.appName
+    const apps =
+        InjectionExtractor.extractUserFromInjected(
+            res
+        ).user.dataStore.getAppsDataStore()
+    apps.getAppDefinition(appName)
+        .then(function (app) {
+            return DockerApi.get().getRunningApplicationBinds(
+                apps.getServiceName(appName, !!app.isLegacyAppName),
+                CaptainManager.get().getMyNodeId()
+            )
+        })
+        .then(function (tasks) {
+            const response = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'Application bind mounts retrieved'
+            )
+            response.data = tasks
+            res.send(response)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
 router.post('/application-storage/paths/', function (req, res) {
     const { root, backend, node_id, directory, create } = req.body || {}
     if (
