@@ -114,4 +114,5 @@ export default interface DockerService {
     PreviousSpec: PreviousSpec
     Endpoint: Endpoint
     UpdateStatus: UpdateStatus
+    ServiceStatus?: { RunningTasks: number }
 }
