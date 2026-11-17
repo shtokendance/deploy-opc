@@ -4,6 +4,7 @@ import fs from 'fs/promises'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import ApiStatusCodes from '../src/api/ApiStatusCodes'
+import DockerApi from '../src/docker/DockerApi'
 import type {
     DiskUsageResponse,
     DiskUsageSeverity,
@@ -262,6 +263,71 @@ describe('disk usage', () => {
                 )
             }
         )
+
+        test('application storage returns only mounted paths for authenticated requests', async () => {
+            const docker = DockerApi.get()
+            const volumes = jest
+                .spyOn(docker, 'getVolumeUsage')
+                .mockResolvedValue([
+                    {
+                        name: 'opc-vol-test',
+                        driver: 'local',
+                        size_bytes: 512,
+                        ref_count: 1,
+                    },
+                ])
+            jest.spyOn(docker, 'getAllServices').mockResolvedValue([
+                {
+                    Spec: {
+                        Name: 'storage-app',
+                        TaskTemplate: {
+                            ContainerSpec: {
+                                Env: ['SECRET=must-not-be-returned'],
+                                Mounts: [
+                                    {
+                                        Type: 'volume',
+                                        Source: 'opc-vol-test',
+                                        Target: '/app/data',
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                    ServiceStatus: { RunningTasks: 1 },
+                } as Awaited<ReturnType<DockerApi['getAllServices']>>[number],
+            ])
+            const storageUrl = url.replace(/diskusage$/, 'application-storage')
+            authorized = false
+            const unauthorized = await fetch(storageUrl)
+            expect(await unauthorized.json()).toMatchObject({
+                status: ApiStatusCodes.STATUS_ERROR_NOT_AUTHORIZED,
+            })
+            expect(volumes).not.toHaveBeenCalled()
+            authorized = true
+            const response = await fetch(storageUrl)
+            const body = await response.json()
+            expect(JSON.stringify(body)).not.toContain('must-not-be-returned')
+            expect(body).toMatchObject({
+                status: ApiStatusCodes.STATUS_OK,
+                data: {
+                    disk: normalUsage,
+                    volumes: [{ name: 'opc-vol-test', size_bytes: 512 }],
+                    services: [
+                        {
+                            name: 'storage-app',
+                            running_tasks: 1,
+                            mounts: [
+                                {
+                                    type: 'volume',
+                                    source: 'opc-vol-test',
+                                    target: '/app/data',
+                                },
+                            ],
+                        },
+                    ],
+                },
+            })
+        })
 
         test('requires authentication before collecting disk usage', async () => {
             authorized = false

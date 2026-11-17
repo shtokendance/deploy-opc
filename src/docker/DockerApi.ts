@@ -223,16 +223,33 @@ class DockerApi {
             })
     }
 
-    getAllServices() {
+    getAllServices(withStatus = false) {
         const self = this
 
         return Promise.resolve()
             .then(function () {
-                return self.dockerode.listServices()
+                return self.dockerode.listServices({ status: withStatus })
             })
             .then(function (services) {
                 return (services || []) as unknown as DockerService[]
             })
+    }
+
+    async getVolumeUsage() {
+        const usage: {
+            Volumes?: {
+                Name: string
+                Driver: string
+                UsageData?: { Size: number; RefCount: number }
+            }[]
+        } = await this.dockerode.df()
+
+        return (usage.Volumes || []).map((volume) => ({
+            name: volume.Name,
+            driver: volume.Driver,
+            size_bytes: volume.UsageData?.Size ?? -1,
+            ref_count: volume.UsageData?.RefCount ?? -1,
+        }))
     }
 
     getServiceRuntimes(serviceNames: string[]): Promise<ServiceRuntime[]> {

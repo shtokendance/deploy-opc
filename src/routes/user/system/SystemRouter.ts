@@ -209,6 +209,42 @@ router.post('/versionInfo/', function (req, res, next) {
         .catch(ApiStatusCodes.createCatcher(res))
 })
 
+router.get('/application-storage/', function (req, res, next) {
+    const docker = DockerApi.get()
+
+    Promise.all([
+        CaptainManager.get().getDiskUsage(),
+        docker.getVolumeUsage(),
+        docker.getAllServices(true),
+    ])
+        .then(function ([disk, volumes, services]) {
+            const response = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'Application storage retrieved'
+            )
+            response.data = {
+                disk,
+                volumes,
+                services: services.map(({ Spec, ServiceStatus }) => ({
+                    name: Spec.Name,
+                    running_tasks: ServiceStatus?.RunningTasks ?? 0,
+                    mounts: (Spec.TaskTemplate.ContainerSpec?.Mounts || [])
+                        .filter(
+                            (mount) =>
+                                mount.Type === 'volume' || mount.Type === 'bind'
+                        )
+                        .map((mount) => ({
+                            type: mount.Type,
+                            source: mount.Source,
+                            target: mount.Target,
+                        })),
+                })),
+            }
+            res.send(response)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
 router.get('/diskusage/', function (req, res, next) {
     return Promise.resolve()
         .then(function () {
