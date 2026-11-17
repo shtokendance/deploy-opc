@@ -240,6 +240,49 @@ class DockerApi {
         return service.Spec.TaskTemplate.ContainerSpec?.Mounts || []
     }
 
+    async getRunningApplicationBinds(serviceName: string, localNodeId: string) {
+        const service = await this.dockerode.getService(serviceName).inspect()
+        const tasks: {
+            NodeID: string
+            Status: { State: string; ContainerStatus?: { ContainerID: string } }
+        }[] = await this.dockerode.listTasks({
+            filters: { service: [service.ID], 'desired-state': ['running'] },
+        })
+        return Promise.all(
+            tasks
+                .filter((task) => task.Status.State === 'running')
+                .map(async (task) => {
+                    const containerId = task.Status.ContainerStatus?.ContainerID
+                    if (!containerId || task.NodeID !== localNodeId) {
+                        return { node_id: task.NodeID, mounts: [] }
+                    }
+                    try {
+                        const container = await this.dockerode
+                            .getContainer(containerId)
+                            .inspect()
+                        const mounts = container.State.Running
+                            ? container.Mounts
+                            : []
+                        return {
+                            node_id: task.NodeID,
+                            mounts: mounts
+                                .filter(
+                                    (mount) => mount.Type === 'bind' && mount.RW
+                                )
+                                .map((mount) => ({
+                                    source: mount.Source,
+                                    target: mount.Destination,
+                                })),
+                        }
+                    } catch (err) {
+                        if ((err as { statusCode?: number }).statusCode !== 404)
+                            throw err
+                        return { node_id: task.NodeID, mounts: [] }
+                    }
+                })
+        )
+    }
+
     async getVolumeUsage() {
         const usage: {
             Volumes?: {
