@@ -162,6 +162,7 @@ export interface UpdateAppDefinitionParams {
     serviceUpdateOverride?: string
     websocketSupport?: boolean
     appDeployTokenConfig?: AppDeployTokenConfig
+    skipServiceUpdate?: boolean
 }
 
 /**
@@ -258,6 +259,7 @@ export async function updateAppDefinition(
         serviceUpdateOverride,
         websocketSupport,
         appDeployTokenConfig,
+        skipServiceUpdate,
     } = params
 
     // Defaults & normalization
@@ -363,7 +365,8 @@ export async function updateAppDefinition(
         normalizedPreDeployFunction,
         normalizedServiceUpdateOverride,
         normalizedWebsocketSupport,
-        normalizedDeployTokenConfig
+        normalizedDeployTokenConfig,
+        ...(skipServiceUpdate ? [true] : [])
     )
 
     Logger.d(`AppName is updated: ${appName}`)
