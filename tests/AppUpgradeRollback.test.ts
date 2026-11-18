@@ -224,4 +224,100 @@ describe('App upgrade, rollback, and cleanup regressions', () => {
 
         expect(unused.map((x) => x.id)).toEqual(['id-v0'])
     })
+
+    test('updateAppDefinition skipServiceUpdate pre-stages config and restores baseline on build failure', async () => {
+        const oldDef = {
+            appName: 'demo',
+            projectId: '',
+            description: 'v1',
+            instanceCount: 1,
+            captainDefinitionRelativeFilePath: './captain-definition',
+            envVars: [{ key: 'VER', value: 'v1' }],
+            volumes: [],
+            tags: [],
+            nodeId: '',
+            notExposeAsWebApp: false,
+            containerHttpPort: 8080,
+            forceSsl: false,
+            ports: [],
+            websocketSupport: true,
+            serviceUpdateOverride: '',
+            customNginxConfig: '',
+            redirectDomain: '',
+            preDeployFunction: '',
+            appDeployTokenConfig: { enabled: false },
+        }
+        const updateAppDefinitionInDb = jest.fn().mockResolvedValue(undefined)
+        const appsDataStore = {
+            getAppDefinition: jest.fn().mockResolvedValue(oldDef),
+            getServiceName: jest.fn((name: string) => `srv-captain--${name}`),
+            updateAppDefinitionInDb,
+            createNewVersion: jest.fn().mockResolvedValue(2),
+            setDeployedVersionAndImage: jest.fn().mockResolvedValue(undefined),
+        }
+        const manager = new ServiceManager(
+            {
+                getNameSpace: () => 'captain',
+                getAppsDataStore: () => appsDataStore,
+                getRegistriesDataStore: () => ({}),
+            } as any,
+            {} as any,
+            {} as any,
+            {} as any,
+            { trackEvent: jest.fn() } as any,
+            {} as any
+        )
+        const ensureServiceSpy = jest
+            .spyOn(manager, 'ensureServiceInitedAndUpdated')
+            .mockResolvedValue(undefined as any)
+
+        await manager.updateAppDefinition(
+            'demo',
+            '',
+            'v2',
+            1,
+            './captain-definition',
+            [{ key: 'VER', value: 'v2' }],
+            [],
+            [],
+            '',
+            false,
+            9090,
+            undefined,
+            false,
+            [],
+            { repo: '', branch: '', user: '', password: '' },
+            '',
+            '',
+            '',
+            '{"TaskTemplate":{}}',
+            true,
+            { enabled: false },
+            true
+        )
+
+        expect(updateAppDefinitionInDb).toHaveBeenCalledTimes(1)
+        expect(ensureServiceSpy).not.toHaveBeenCalled()
+
+        // Now fail the subsequent build -> pre-staged definition must revert to oldDef
+        ;(manager as any).imageMaker = {
+            ensureImage: jest
+                .fn()
+                .mockRejectedValue(new Error('simulated v2 build failure')),
+        }
+
+        await expect(
+            manager.scheduleDeployNewVersion('demo', {
+                captainDefinitionContentSource: {
+                    captainDefinitionContent: '{}',
+                    gitHash: '',
+                },
+            })
+        ).rejects.toThrow('simulated v2 build failure')
+
+        expect(updateAppDefinitionInDb).toHaveBeenCalledTimes(2)
+        const revertCall = updateAppDefinitionInDb.mock.calls[1]
+        expect(revertCall[5]).toEqual([{ key: 'VER', value: 'v1' }])
+        expect(revertCall[10]).toBe(8080)
+    })
 })

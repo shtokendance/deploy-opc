@@ -73,6 +73,7 @@ class ServiceManager {
     }
 
     private activeOrScheduledBuilds: IHashMapGeneric<boolean>
+    private pendingPreStagedDefinitions: IHashMapGeneric<IAppDef>
     private buildLogsManager: BuildLogsManager
     private queuedBuilds: QueuedBuild[]
     private isReady: boolean
@@ -88,6 +89,7 @@ class ServiceManager {
         private domainResolveChecker: DomainResolveChecker
     ) {
         this.activeOrScheduledBuilds = {}
+        this.pendingPreStagedDefinitions = {}
         this.queuedBuilds = []
         this.buildLogsManager = new BuildLogsManager()
         this.isReady = true
@@ -248,12 +250,27 @@ class ServiceManager {
                 return self.ensureServiceInitedAndUpdated(appName)
             })
             .then(function () {
+                delete self.pendingPreStagedDefinitions[appName]
                 advanceBuildQueueOnce()
             })
             .catch(function (error) {
-                self.logBuildFailed(appName, error)
-                advanceBuildQueueOnce()
-                return Promise.reject(error)
+                const preStagedOld = self.pendingPreStagedDefinitions[appName]
+                delete self.pendingPreStagedDefinitions[appName]
+                const rollbackPreStaged = preStagedOld
+                    ? self
+                          .restoreAppDefinition(appName, preStagedOld)
+                          .catch(function (restoreErr) {
+                              Logger.w(
+                                  `Failed to restore pre-staged definition for ${appName}: ${restoreErr}`
+                              )
+                          })
+                    : Promise.resolve()
+
+                return rollbackPreStaged.then(function () {
+                    self.logBuildFailed(appName, error)
+                    advanceBuildQueueOnce()
+                    return Promise.reject(error)
+                })
             })
     }
 
@@ -642,6 +659,41 @@ class ServiceManager {
         return requireFromString(preDeployFunction)
     }
 
+    private restoreAppDefinition(appName: string, snapshot: IAppDef) {
+        const self = this
+        return self.dataStore.getAppsDataStore().updateAppDefinitionInDb(
+            appName,
+            snapshot.projectId,
+            snapshot.description,
+            snapshot.instanceCount,
+            snapshot.captainDefinitionRelativeFilePath,
+            snapshot.envVars,
+            snapshot.volumes,
+            snapshot.tags || [],
+            snapshot.nodeId || '',
+            snapshot.notExposeAsWebApp,
+            snapshot.containerHttpPort || 80,
+            snapshot.httpAuth,
+            snapshot.forceSsl,
+            snapshot.ports,
+            snapshot.appPushWebhook?.repoInfo || {
+                repo: '',
+                branch: '',
+                user: '',
+                password: '',
+            },
+            self.authenticator,
+            snapshot.customNginxConfig || '',
+            snapshot.redirectDomain || '',
+            snapshot.preDeployFunction || '',
+            snapshot.serviceUpdateOverride || '',
+            snapshot.websocketSupport,
+            snapshot.appDeployTokenConfig || {
+                enabled: false,
+            }
+        )
+    }
+
     ensureNotBuilding(appName: string) {
         if (this.activeOrScheduledBuilds[appName])
             throw ApiStatusCodes.createError(
@@ -662,7 +714,7 @@ class ServiceManager {
         nodeId: string,
         notExposeAsWebApp: boolean,
         containerHttpPort: number,
-        httpAuth: IHttpAuth,
+        httpAuth: IHttpAuth | undefined,
         forceSsl: boolean,
         ports: IAppPort[],
         repoInfo: RepoInfo,
@@ -671,7 +723,8 @@ class ServiceManager {
         preDeployFunction: string,
         serviceUpdateOverride: string,
         websocketSupport: boolean,
-        appDeployTokenConfig: AppDeployTokenConfig
+        appDeployTokenConfig: AppDeployTokenConfig,
+        skipServiceUpdate?: boolean
     ) {
         const self = this
         const dataStore = this.dataStore
@@ -786,6 +839,15 @@ class ServiceManager {
             })
             .then(function (appDef) {
                 existingAppDefinition = appDef
+                if (skipServiceUpdate) {
+                    if (!self.pendingPreStagedDefinitions[appName]) {
+                        self.pendingPreStagedDefinitions[appName] = JSON.parse(
+                            JSON.stringify(appDef)
+                        )
+                    }
+                } else {
+                    delete self.pendingPreStagedDefinitions[appName]
+                }
 
                 return dataStore
                     .getAppsDataStore()
@@ -815,6 +877,12 @@ class ServiceManager {
                     )
             })
             .then(function () {
+                if (skipServiceUpdate) {
+                    Logger.d(
+                        `Pre-staged definition saved for ${appName}; skipping service update until next deployment.`
+                    )
+                    return
+                }
                 return self.ensureServiceInitedAndUpdated(appName)
             })
             .catch(function (error) {
@@ -828,40 +896,10 @@ class ServiceManager {
                         Logger.d(
                             `nginx validation failed, reverting configs for: ${appName}`
                         )
-                        return dataStore
-                            .getAppsDataStore()
-                            .updateAppDefinitionInDb(
+                        return self
+                            .restoreAppDefinition(
                                 appName,
-                                existingAppDefinition.projectId,
-                                existingAppDefinition.description,
-                                existingAppDefinition.instanceCount,
-                                existingAppDefinition.captainDefinitionRelativeFilePath,
-                                existingAppDefinition.envVars,
-                                existingAppDefinition.volumes,
-                                existingAppDefinition.tags || [],
-                                existingAppDefinition.nodeId || '',
-                                existingAppDefinition.notExposeAsWebApp,
-                                existingAppDefinition.containerHttpPort || 80,
-                                existingAppDefinition.httpAuth,
-                                existingAppDefinition.forceSsl,
-                                existingAppDefinition.ports,
-                                existingAppDefinition.appPushWebhook
-                                    ?.repoInfo || {
-                                    repo: '',
-                                    branch: '',
-                                    user: '',
-                                    password: '',
-                                },
-                                self.authenticator,
-                                existingAppDefinition.customNginxConfig || '',
-                                existingAppDefinition.redirectDomain || '',
-                                existingAppDefinition.preDeployFunction || '',
-                                existingAppDefinition.serviceUpdateOverride ||
-                                    '',
-                                existingAppDefinition.websocketSupport,
-                                existingAppDefinition.appDeployTokenConfig || {
-                                    enabled: false,
-                                }
+                                existingAppDefinition
                             )
                             .then(function () {
                                 self.reloadLoadBalancer()
