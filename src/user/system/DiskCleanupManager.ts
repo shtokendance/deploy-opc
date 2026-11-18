@@ -96,21 +96,31 @@ export default class DiskCleanupManager {
 
                     Object.keys(apps).forEach(function (appName) {
                         const app = apps[appName]
-                        for (let k = 0; k < mostRecentLimit + 1; k++) {
-                            const versionToCheck =
-                                Number(app.deployedVersion) - k
+                        const versions = app.versions || []
+                        const keepImages = new Set<string>()
+                        const currentVersionEntry = versions.find(
+                            (v) => v.version === Number(app.deployedVersion)
+                        )
+                        if (currentVersionEntry?.deployedImageName) {
+                            keepImages.add(
+                                currentVersionEntry.deployedImageName
+                            )
+                        }
 
-                            if (versionToCheck < 0) continue
+                        const validVersions = versions
+                            .filter((v) => !!v.deployedImageName)
+                            .sort((a, b) => b.version - a.version)
 
-                            let deployedImage = ''
-                            app.versions.forEach((v) => {
-                                if (v.version === versionToCheck) {
-                                    deployedImage = v.deployedImageName || ''
-                                }
-                            })
+                        for (const v of validVersions) {
+                            if (keepImages.size >= mostRecentLimit + 1) {
+                                break
+                            }
+                            if (v.deployedImageName) {
+                                keepImages.add(v.deployedImageName)
+                            }
+                        }
 
-                            if (!deployedImage) continue
-
+                        for (const deployedImage of keepImages) {
                             if (repoTags.indexOf(deployedImage) >= 0) {
                                 imageInUse = true
                             }

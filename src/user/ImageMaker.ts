@@ -152,31 +152,42 @@ export default class ImageMaker {
                     .getCaptainDefinition(captainDefinitionAbsolutePath)
                     .then(function (captainDefinition) {
                         if (captainDefinition.imageName) {
-                            logs.log(
-                                `An explicit image name was provided (${captainDefinition.imageName}). Therefore, no build process is needed.`
-                            )
-
-                            logs.log(
-                                `Pulling this image: ${captainDefinition.imageName} This process might take a few minutes.`
-                            )
-
                             const providedImageName =
                                 captainDefinition.imageName + ''
 
-                            return Promise.resolve() //
-                                .then(function () {
-                                    return self.dockerRegistryHelper.getDockerAuthObjectForImageName(
-                                        providedImageName
+                            logs.log(
+                                `An explicit image name was provided (${providedImageName}). Therefore, no build process is needed.`
+                            )
+
+                            return self.dockerApi
+                                .isImageAvailableLocally(providedImageName)
+                                .then(function (isAvailableLocally) {
+                                    if (isAvailableLocally) {
+                                        logs.log(
+                                            `Image ${providedImageName} already exists locally, skipping pull.`
+                                        )
+                                        return providedImageName
+                                    }
+
+                                    logs.log(
+                                        `Pulling this image: ${providedImageName} This process might take a few minutes.`
                                     )
-                                })
-                                .then(function (authObj) {
-                                    return self.dockerApi.pullImage(
-                                        providedImageName,
-                                        authObj
-                                    )
-                                })
-                                .then(function () {
-                                    return providedImageName
+
+                                    return Promise.resolve() //
+                                        .then(function () {
+                                            return self.dockerRegistryHelper.getDockerAuthObjectForImageName(
+                                                providedImageName
+                                            )
+                                        })
+                                        .then(function (authObj) {
+                                            return self.dockerApi.pullImage(
+                                                providedImageName,
+                                                authObj
+                                            )
+                                        })
+                                        .then(function () {
+                                            return providedImageName
+                                        })
                                 })
                         }
 
