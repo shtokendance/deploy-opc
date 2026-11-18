@@ -9,7 +9,10 @@ import DockerUtils from '../../../docker/DockerUtils'
 import InjectionExtractor from '../../../injection/InjectionExtractor'
 import { IAppDef } from '../../../models/AppDefinition'
 import { AutomatedCleanupConfigsCleaner } from '../../../models/AutomatedCleanupConfigs'
-import { prepareApplicationVolumePath } from '../../../user/system/ApplicationVolumePaths'
+import {
+    listApplicationVolumeRoots,
+    prepareApplicationVolumePath,
+} from '../../../user/system/ApplicationVolumePaths'
 import CaptainManager from '../../../user/system/CaptainManager'
 import VersionManager from '../../../user/system/VersionManager'
 import CaptainConstants from '../../../utils/CaptainConstants'
@@ -212,13 +215,29 @@ router.post('/versionInfo/', function (req, res, next) {
 
 router.get('/application-storage/', function (req, res, next) {
     const docker = DockerApi.get()
+    const captain = CaptainManager.get()
 
     Promise.all([
-        CaptainManager.get().getDiskUsage(),
+        captain.getDiskUsage(),
         docker.getVolumeUsage(),
         docker.getAllServices(true),
+        docker
+            .getServiceMounts(CaptainConstants.captainServiceName)
+            .catch(() => []),
     ])
-        .then(function ([disk, volumes, services]) {
+        .then(async function ([disk, volumes, services, serviceMounts]) {
+            let nodeId = disk?.nodes?.[0]?.nodeId || ''
+            if (!nodeId) {
+                try {
+                    nodeId = captain.getMyNodeId()
+                } catch {
+                    nodeId = ''
+                }
+            }
+            const volumeRoots = await listApplicationVolumeRoots(
+                nodeId,
+                serviceMounts
+            )
             const response = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
                 'Application storage retrieved'
@@ -226,6 +245,7 @@ router.get('/application-storage/', function (req, res, next) {
             response.data = {
                 disk,
                 volumes,
+                volume_roots: volumeRoots,
                 services: services.map(({ Spec, ServiceStatus }) => ({
                     name: Spec.Name,
                     running_tasks: ServiceStatus?.RunningTasks ?? 0,
