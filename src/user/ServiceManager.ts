@@ -1,3 +1,4 @@
+import fs = require('fs-extra')
 import ApiStatusCodes from '../api/ApiStatusCodes'
 import DataStore from '../datastore/DataStore'
 import DockerApi, { IDockerUpdateOrders } from '../docker/DockerApi'
@@ -116,7 +117,9 @@ class ServiceManager {
         const activeBuildAppName = self.isAnyBuildRunning()
         this.activeOrScheduledBuilds[appName] = true
 
-        self.buildLogsManager.getAppBuildLogs(appName).clear()
+        if (!activeBuildAppName) {
+            self.buildLogsManager.getAppBuildLogs(appName).clear()
+        }
 
         if (activeBuildAppName) {
             const existingBuildForTheSameApp = self.queuedBuilds.find(
@@ -129,6 +132,17 @@ class ServiceManager {
                     .log(
                         `A build for ${appName} was queued, it's now being replaced with a new build...`
                     )
+
+                const prevTarPath =
+                    existingBuildForTheSameApp.source.uploadedTarPathSource
+                        ?.uploadedTarPath
+                const nextTarPath =
+                    source.uploadedTarPathSource?.uploadedTarPath
+                if (prevTarPath && prevTarPath !== nextTarPath) {
+                    fs.remove(prevTarPath).catch(function () {
+                        // best effort cleanup of superseded upload
+                    })
+                }
 
                 // replacing the new source!
                 existingBuildForTheSameApp.source = source
@@ -179,6 +193,9 @@ class ServiceManager {
         let deployedVersion: number
         let hasAdvancedBuildQueue = false
 
+        self.activeOrScheduledBuilds[appName] = true
+        self.buildLogsManager.getAppBuildLogs(appName).clear()
+
         function advanceBuildQueueOnce() {
             if (hasAdvancedBuildQueue) {
                 return
@@ -219,8 +236,6 @@ class ServiceManager {
                     )
             })
             .then(function () {
-                advanceBuildQueueOnce()
-
                 self.eventLogger.trackEvent(
                     CapRoverEventFactory.create(
                         CapRoverEventType.AppBuildSuccessful,
@@ -232,12 +247,13 @@ class ServiceManager {
 
                 return self.ensureServiceInitedAndUpdated(appName)
             })
-            .catch(function (error) {
+            .then(function () {
                 advanceBuildQueueOnce()
-                return new Promise<void>(function (resolve, reject) {
-                    self.logBuildFailed(appName, error)
-                    reject(error)
-                })
+            })
+            .catch(function (error) {
+                self.logBuildFailed(appName, error)
+                advanceBuildQueueOnce()
+                return Promise.reject(error)
             })
     }
 

@@ -565,6 +565,24 @@ class DockerApi {
             })
     }
 
+    isImageAvailableLocally(imageNameIncludingTag: string): Promise<boolean> {
+        const self = this
+
+        return Promise.resolve()
+            .then(function () {
+                return self.dockerode.getImage(imageNameIncludingTag).inspect()
+            })
+            .then(function () {
+                return true
+            })
+            .catch(function (err) {
+                if (err && err.statusCode === 404) {
+                    return false
+                }
+                return false
+            })
+    }
+
     pullImage(
         imageNameIncludingTag: string,
         authObj: DockerAuthObj | undefined
