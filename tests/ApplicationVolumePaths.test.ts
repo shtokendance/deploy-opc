@@ -53,6 +53,10 @@ describe('ApplicationVolumePaths.listApplicationVolumeRoots', () => {
                     filesystem_type: 'ext4',
                     writable: true,
                     available: true,
+                    total_bytes: expect.any(Number),
+                    used_bytes: expect.any(Number),
+                    free_bytes: expect.any(Number),
+                    usage_ratio: expect.any(Number),
                 },
                 {
                     root: ossRoot,
@@ -61,6 +65,10 @@ describe('ApplicationVolumePaths.listApplicationVolumeRoots', () => {
                     filesystem_type: 'fuse.ossfs2',
                     writable: true,
                     available: true,
+                    total_bytes: expect.any(Number),
+                    used_bytes: expect.any(Number),
+                    free_bytes: expect.any(Number),
+                    usage_ratio: expect.any(Number),
                 },
                 {
                     root: unmountedRoot,
@@ -72,6 +80,7 @@ describe('ApplicationVolumePaths.listApplicationVolumeRoots', () => {
                     error: 'Storage root is outside the configured Deploy mounts',
                 },
             ])
+            expect(roots[0].total_bytes).toBeGreaterThan(0)
         } finally {
             await fs.rm(base, { recursive: true, force: true })
         }

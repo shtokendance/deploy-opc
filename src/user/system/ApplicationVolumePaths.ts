@@ -11,7 +11,37 @@ export interface ApplicationVolumeRootInfo {
     filesystem_type: string
     writable: boolean
     available: boolean
+    total_bytes?: number
+    used_bytes?: number
+    free_bytes?: number
+    usage_ratio?: number
     error?: string
+}
+
+async function readRootDiskUsage(root: string): Promise<{
+    total_bytes?: number
+    used_bytes?: number
+    free_bytes?: number
+    usage_ratio?: number
+}> {
+    try {
+        const stats = await fs.statfs(root)
+        const bsize = Number(stats.bsize)
+        const total = Number(stats.blocks) * bsize
+        const free = Number(stats.bavail) * bsize
+        const used = total >= free ? total - free : 0
+        if (total > 0) {
+            return {
+                total_bytes: total,
+                used_bytes: used,
+                free_bytes: free,
+                usage_ratio: Math.round((used * 1000) / total) / 10,
+            }
+        }
+    } catch {
+        // Ignore statfs errors on filesystems that do not report capacity.
+    }
+    return {}
 }
 
 interface MountInfoEntry {
@@ -152,6 +182,8 @@ export async function listApplicationVolumeRoots(
                 : unsupportedFuse
                   ? ''
                   : 'local-directory'
+            const diskUsage =
+                backend !== '' ? await readRootDiskUsage(root) : {}
             items.push({
                 root,
                 node_id: nodeId,
@@ -159,6 +191,7 @@ export async function listApplicationVolumeRoots(
                 filesystem_type: filesystem.type,
                 writable: filesystem.writable,
                 available: backend !== '',
+                ...diskUsage,
                 ...(backend === ''
                     ? {
                           error: 'Storage root filesystem does not match a supported backend',
