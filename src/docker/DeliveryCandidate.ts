@@ -151,6 +151,7 @@ async function candidateProbeContainer(
     const self = await docker.getContainer(hostname()).inspect()
     return ensureCandidateContainer(docker, name, labels, {
         Image: self.Image,
+        ...(networkMode === 'none' ? { Hostname: 'localhost' } : {}),
         Entrypoint: ['node'],
         Cmd: ['-e', 'setInterval(() => {}, 2147483647)'],
         HostConfig: {
@@ -280,6 +281,8 @@ export async function startDeliveryCandidate(
     }
     await ensureCandidateContainer(docker, name, candidateLabels, {
         Image: image,
+        // Containers joining the sandbox inherit its loopback hostname.
+        ...(networkMode === 'none' ? { Hostname: 'localhost' } : {}),
         Labels: { [componentLabel]: 'app' },
         Env: env.map(({ key, value }) => `${key}=${value}`),
         Volumes: Object.fromEntries(sandbox.mounts.map((path) => [path, {}])),

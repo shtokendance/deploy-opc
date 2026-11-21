@@ -75,6 +75,8 @@ test('candidate services and temporary volumes are owned by the delivery and cle
     expect(instances.get(`${prefix}-sandbox`)?.HostConfig?.NetworkMode).toBe(
         'none'
     )
+    expect(instances.get(`${prefix}-sandbox`)?.Hostname).toBe('localhost')
+    expect(instances.get(prefix)?.Hostname).toBeUndefined()
     for (const name of [
         prefix,
         `${prefix}-service-5432`,
