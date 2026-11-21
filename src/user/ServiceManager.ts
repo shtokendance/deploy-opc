@@ -2,7 +2,7 @@ import fs = require('fs-extra')
 import ApiStatusCodes from '../api/ApiStatusCodes'
 import DataStore from '../datastore/DataStore'
 import DockerApi, { IDockerUpdateOrders } from '../docker/DockerApi'
-import { CandidateRequest } from '../docker/DeliveryCandidate'
+import { CandidateRequest, CandidateSandbox } from '../docker/DeliveryCandidate'
 import {
     AppDeployTokenConfig,
     IAppDef,
@@ -1074,7 +1074,8 @@ class ServiceManager {
     async startDeliveryCandidate(
         appName: string,
         receipt: string,
-        env: IAppEnvVar[]
+        env: IAppEnvVar[],
+        sandbox: CandidateSandbox
     ) {
         const app = await this.dataStore
             .getAppsDataStore()
@@ -1090,7 +1091,8 @@ class ServiceManager {
             appName,
             receipt,
             image,
-            env
+            env,
+            sandbox
         )
     }
 

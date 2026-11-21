@@ -38,6 +38,8 @@ import Utils from '../utils/Utils'
 import Dockerode = require('dockerode')
 import {
     CandidateRequest,
+    CandidateSandbox,
+    candidateServiceImages,
     getDeliveryCandidateLogs,
     probeDeliveryCandidate,
     startDeliveryCandidate,
@@ -143,17 +145,68 @@ class DockerApi {
         return dockerApiInstance
     }
 
+    private readonly candidateOperations = new Map<string, Promise<unknown>>()
+
+    private async runCandidateOperation<T>(
+        receipt: string,
+        operation: () => Promise<T>
+    ) {
+        const previous = this.candidateOperations.get(receipt)
+        const current = (
+            previous ? previous.catch(() => {}) : Promise.resolve()
+        ).then(operation)
+        this.candidateOperations.set(receipt, current)
+        try {
+            return await current
+        } finally {
+            if (this.candidateOperations.get(receipt) === current) {
+                this.candidateOperations.delete(receipt)
+            }
+        }
+    }
+
     startDeliveryCandidate(
         app: string,
         receipt: string,
         image: string,
-        env: IAppEnvVar[]
+        env: IAppEnvVar[],
+        sandbox: CandidateSandbox
     ) {
-        return startDeliveryCandidate(this.dockerode, app, receipt, image, env)
+        return this.runCandidateOperation(receipt, async () => {
+            const kinds = new Set(
+                sandbox.services.map((service) => service.kind)
+            )
+            await Promise.all(
+                [...kinds].map(async (kind) => {
+                    const dependencyImage = candidateServiceImages[kind]
+                    if (
+                        !(await this.isImageAvailableLocally(dependencyImage))
+                    ) {
+                        try {
+                            await this.pullImage(dependencyImage, undefined)
+                        } catch {
+                            throw new Error(
+                                `Could not prepare the temporary ${kind} image (${dependencyImage})`
+                            )
+                        }
+                    }
+                })
+            )
+            await startDeliveryCandidate(
+                this.dockerode,
+                app,
+                receipt,
+                image,
+                env,
+                sandbox
+            )
+        })
     }
 
     stopDeliveryCandidate(app: string, receipt: string) {
-        return stopDeliveryCandidate(this.dockerode, app, receipt)
+        return this.runCandidateOperation(receipt, () =>
+            stopDeliveryCandidate(this.dockerode, app, receipt)
+        )
     }
 
     getDeliveryCandidateLogs(app: string, receipt: string) {

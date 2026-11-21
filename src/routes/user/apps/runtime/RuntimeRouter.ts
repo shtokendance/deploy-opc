@@ -3,6 +3,8 @@ import ApiStatusCodes from '../../../../api/ApiStatusCodes'
 import BaseApi from '../../../../api/BaseApi'
 import InjectionExtractor from '../../../../injection/InjectionExtractor'
 import { validateHeaderName, validateHeaderValue } from 'node:http'
+import { posix } from 'node:path'
+import type { CandidateService } from '../../../../docker/DeliveryCandidate'
 
 const router = express.Router()
 
@@ -99,7 +101,7 @@ const hopByHop = new Set([
 ])
 
 router.post<{ appName: string; receipt: string }>(
-    '/:appName/candidates/:receipt',
+    ['/:appName/candidates/:receipt', '/:appName/candidates/:receipt/sandbox'],
     async function (req, res) {
         const { serviceManager } =
             InjectionExtractor.extractUserFromInjected(res).user
@@ -117,10 +119,38 @@ router.post<{ appName: string; receipt: string }>(
                 )
             )
                 throw new Error('Invalid candidate environment')
+            const services: unknown = req.body?.services ?? []
+            const mounts: unknown = req.body?.mounts ?? []
+            if (
+                !Array.isArray(services) ||
+                services.length > 8 ||
+                !services.every(isCandidateService) ||
+                new Set(services.map((service) => service.port)).size !==
+                    services.length
+            ) {
+                throw new Error('Invalid temporary candidate services')
+            }
+            if (
+                !Array.isArray(mounts) ||
+                !mounts.every(
+                    (path) =>
+                        typeof path === 'string' &&
+                        path.startsWith('/') &&
+                        path !== '/' &&
+                        posix.normalize(path) === path &&
+                        !path.endsWith('/') &&
+                        !path.includes('\0') &&
+                        !/^\/(dev|proc|sys)(\/|$)/.test(path)
+                ) ||
+                new Set(mounts).size !== mounts.length
+            ) {
+                throw new Error('Invalid temporary candidate mount paths')
+            }
             await serviceManager.startDeliveryCandidate(
                 req.params.appName,
                 req.params.receipt,
-                env
+                env,
+                { services, mounts }
             )
             res.send(
                 new BaseApi(
@@ -133,6 +163,21 @@ router.post<{ appName: string; receipt: string }>(
         }
     }
 )
+
+function isCandidateService(value: unknown): value is CandidateService {
+    if (!value || typeof value !== 'object') return false
+    const { kind, port, password } = value as Partial<CandidateService>
+    const hasPassword =
+        typeof password === 'string' && /^[a-f0-9]{32}$/.test(password)
+    return (
+        typeof port === 'number' &&
+        Number.isInteger(port) &&
+        port >= 1024 &&
+        port <= 65535 &&
+        ((kind === 'postgres' && hasPassword) ||
+            (kind === 'redis' && (password === undefined || hasPassword)))
+    )
+}
 
 router.delete<{ appName: string; receipt: string }>(
     '/:appName/candidates/:receipt',
