@@ -668,6 +668,14 @@ class AppsDataStore {
         const self = this
 
         return this.getAppDefinition(appName).then(function (app) {
+            const resumedBuild = buildReceipt
+                ? app.versions.find(
+                      (version) =>
+                          version.preparedBuild?.receipt === buildReceipt
+                  )
+                : undefined
+            if (resumedBuild) return resumedBuild.version
+
             const active = app.versions.find(
                 (version) => version.version === app.deployedVersion
             )
@@ -982,7 +990,8 @@ class AppsDataStore {
     registerAppDefinition(
         appName: string,
         projectId: string | undefined,
-        hasPersistentData: boolean
+        hasPersistentData: boolean,
+        notExposeAsWebApp = false
     ) {
         const self = this
 
@@ -1021,7 +1030,7 @@ class AppsDataStore {
                 tags: [],
                 versions: [],
                 deployedVersion: 0,
-                notExposeAsWebApp: false,
+                notExposeAsWebApp,
                 customDomain: [],
                 hasDefaultSubDomainSsl: false,
                 redirectDomain: '',

@@ -1,7 +1,10 @@
 import express = require('express')
 import ApiStatusCodes from '../../../../api/ApiStatusCodes'
 import BaseApi from '../../../../api/BaseApi'
-import { uploadCaptainDefinitionContent as uploadCaptainDefinitionContentHandler } from '../../../../handlers/users/apps/appdata/AppDataHandler'
+import {
+    parseCandidateBuildArgs,
+    uploadCaptainDefinitionContent as uploadCaptainDefinitionContentHandler,
+} from '../../../../handlers/users/apps/appdata/AppDataHandler'
 import InjectionExtractor from '../../../../injection/InjectionExtractor'
 import fs from 'fs-extra'
 import multer = require('multer')
@@ -100,10 +103,13 @@ router.post<{ appName: string; receipt: string }>(
             const app = await dataStore
                 .getAppsDataStore()
                 .getAppDefinition(appName)
+            const existing = app.versions.find(
+                (version) => version.preparedBuild?.receipt === receipt
+            )?.preparedBuild
             if (
-                app.versions.some(
-                    (version) => version.preparedBuild?.receipt === receipt
-                )
+                existing?.image ||
+                existing?.error ||
+                (existing && serviceManager.isAppBuilding(appName))
             ) {
                 res.send(
                     new BaseApi(
@@ -125,6 +131,7 @@ router.post<{ appName: string; receipt: string }>(
                     isDetachedBuild: true,
                     uploadedTarPathSource: file,
                     buildReceipt: receipt,
+                    buildArgs: parseCandidateBuildArgs(req.body?.buildArgs),
                 },
                 serviceManager
             )
