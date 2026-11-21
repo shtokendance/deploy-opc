@@ -44,6 +44,12 @@ export interface RepoInfoEncrypted {
 }
 
 export interface IAppVersion {
+    preparedBuild?: {
+        receipt: string
+        image?: string
+        error?: string
+        log?: string
+    }
     version: number
     deployedImageName?: string // empty if the deploy is not completed
     timeStamp: string

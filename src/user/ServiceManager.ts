@@ -207,9 +207,16 @@ class ServiceManager {
             self.onBuildFinished(appName)
         }
 
+        function candidateBuildLog() {
+            const lines: string[] = self.getBuildStatus(appName).logs.lines
+            return lines.join('\n').trim().slice(-12_000)
+        }
+
         return Promise.resolve() //
             .then(function () {
-                return dataStore.getAppsDataStore().createNewVersion(appName)
+                return dataStore
+                    .getAppsDataStore()
+                    .createNewVersion(appName, source.buildReceipt)
             })
             .then(function (appVersion) {
                 deployedVersion = appVersion
@@ -217,7 +224,9 @@ class ServiceManager {
                     .getAppsDataStore()
                     .getAppDefinition(appName)
                     .then(function (app) {
-                        const envVars = app.envVars || []
+                        const envVars = source.buildReceipt
+                            ? []
+                            : app.envVars || []
 
                         return self.imageMaker.ensureImage(
                             source,
@@ -229,6 +238,14 @@ class ServiceManager {
                     })
             })
             .then(function (builtImage) {
+                if (source.buildReceipt) {
+                    return dataStore
+                        .getAppsDataStore()
+                        .savePreparedBuild(appName, deployedVersion, {
+                            image: builtImage.imageName,
+                            log: candidateBuildLog(),
+                        })
+                }
                 return dataStore
                     .getAppsDataStore()
                     .setDeployedVersionAndImage(
@@ -238,6 +255,7 @@ class ServiceManager {
                     )
             })
             .then(function () {
+                if (source.buildReceipt) return
                 self.eventLogger.trackEvent(
                     CapRoverEventFactory.create(
                         CapRoverEventType.AppBuildSuccessful,
@@ -250,10 +268,28 @@ class ServiceManager {
                 return self.ensureServiceInitedAndUpdated(appName)
             })
             .then(function () {
-                delete self.pendingPreStagedDefinitions[appName]
+                if (!source.buildReceipt)
+                    delete self.pendingPreStagedDefinitions[appName]
                 advanceBuildQueueOnce()
             })
             .catch(function (error) {
+                if (source.buildReceipt) {
+                    self.logBuildFailed(appName, error)
+                    const record =
+                        deployedVersion === undefined
+                            ? Promise.resolve()
+                            : dataStore
+                                  .getAppsDataStore()
+                                  .savePreparedBuild(appName, deployedVersion, {
+                                      error: 'Candidate image build failed',
+                                      log: candidateBuildLog(),
+                                  })
+                    return record
+                        .finally(advanceBuildQueueOnce)
+                        .then(function () {
+                            return Promise.reject(error)
+                        })
+                }
                 const preStagedOld = self.pendingPreStagedDefinitions[appName]
                 delete self.pendingPreStagedDefinitions[appName]
                 const rollbackPreStaged = preStagedOld
@@ -1007,6 +1043,23 @@ class ServiceManager {
             .then(function (runtimes) {
                 return { appName, ...runtimes[0] }
             })
+    }
+
+    async setApplicationWriteHold(appName: string, hold: boolean) {
+        const apps = this.dataStore.getAppsDataStore()
+        const app = await apps.getAppDefinition(appName)
+        await this.dockerApi.setApplicationReplicas(
+            apps.getServiceName(appName, !!app.isLegacyAppName),
+            hold ? 0 : app.instanceCount
+        )
+    }
+
+    async isApplicationWriteHeld(appName: string) {
+        const apps = this.dataStore.getAppsDataStore()
+        const app = await apps.getAppDefinition(appName)
+        return this.dockerApi.isApplicationWriteHeld(
+            apps.getServiceName(appName, !!app.isLegacyAppName)
+        )
     }
 
     logBuildFailed(appName: string, error: string) {

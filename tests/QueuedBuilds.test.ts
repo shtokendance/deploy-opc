@@ -37,6 +37,7 @@ describe('ServiceManager queued builds', () => {
                 captainDefinitionRelativeFilePath: './captain-definition',
             }),
             setDeployedVersionAndImage: jest.fn().mockResolvedValue(undefined),
+            savePreparedBuild: jest.fn().mockResolvedValue(undefined),
         }
         const manager = new ServiceManager(
             {
@@ -56,6 +57,32 @@ describe('ServiceManager queued builds', () => {
         )
         return manager
     }
+
+    test('a candidate build records its image and leaves the running service and its configuration alone', async () => {
+        const imageName = 'img-captain-app:1'
+        const ensureImage = jest.fn().mockResolvedValue({ imageName })
+        const manager = serviceManager(ensureImage)
+        const apps = (manager as any).dataStore.getAppsDataStore()
+        apps.getAppDefinition.mockResolvedValue({
+            envVars: [{ key: 'DATABASE_URL', value: 'runtime-only' }],
+            captainDefinitionRelativeFilePath: './captain-definition',
+        })
+        const buildReceipt = '55711c0b-06de-4345-9f09-439bfdf4b2f2'
+
+        await manager.scheduleDeployNewVersion('app', {
+            ...source,
+            buildReceipt,
+        })
+
+        expect(apps.createNewVersion).toHaveBeenCalledWith('app', buildReceipt)
+        expect(ensureImage.mock.calls[0][4]).toEqual([])
+        expect(apps.savePreparedBuild).toHaveBeenCalledWith('app', 1, {
+            image: imageName,
+            log: '',
+        })
+        expect(apps.setDeployedVersionAndImage).not.toHaveBeenCalled()
+        expect(manager.ensureServiceInitedAndUpdated).not.toHaveBeenCalled()
+    })
 
     test('a build queued behind another resolves once it has run', async () => {
         // A one-click app registered while another app builds waits on this promise

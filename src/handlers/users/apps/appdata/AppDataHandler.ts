@@ -9,6 +9,7 @@ export interface UploadCaptainDefinitionContentParams {
     captainDefinitionContent?: string
     gitHash?: string
     uploadedTarPathSource?: string
+    buildReceipt?: string
 }
 
 export async function uploadCaptainDefinitionContent(
@@ -21,6 +22,7 @@ export async function uploadCaptainDefinitionContent(
         captainDefinitionContent,
         gitHash,
         uploadedTarPathSource,
+        buildReceipt,
     } = params
 
     const hasTar = !!uploadedTarPathSource
@@ -32,10 +34,22 @@ export async function uploadCaptainDefinitionContent(
             'Either uploadedTarPathSource or captainDefinitionContent should be provided, but not both.'
         )
     }
+    if (
+        buildReceipt &&
+        (!hasTar ||
+            !isDetachedBuild ||
+            !/^[a-f0-9-]{32,36}$/.test(buildReceipt))
+    ) {
+        throw ApiStatusCodes.createError(
+            ApiStatusCodes.ILLEGAL_OPERATION,
+            'Prepared builds require an uploaded tar, detached mode and a valid receipt.'
+        )
+    }
 
     const promiseToDeployNewVer = serviceManager.scheduleDeployNewVersion(
         appName,
         {
+            buildReceipt,
             uploadedTarPathSource: hasTar
                 ? {
                       uploadedTarPath: uploadedTarPathSource as string,
