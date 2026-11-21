@@ -1,12 +1,33 @@
 import Docker = require('dockerode')
+import { createHash } from 'node:crypto'
 import { hostname } from 'node:os'
 import { PassThrough } from 'node:stream'
+import { setTimeout as delay } from 'node:timers/promises'
 import { IAppEnvVar } from '../models/AppDefinition'
 
 const candidateLabel = 'com.opc.delivery-candidate'
 const appLabel = 'com.opc.delivery-app'
 const relayLabel = 'com.opc.delivery-candidate-relay'
+const componentLabel = 'com.opc.delivery-candidate-component'
+const configLabel = 'com.opc.delivery-candidate-config'
 const maxOutput = 512 * 1024
+
+export const candidateServiceImages = {
+    postgres: process.env.OPC_PREVIEW_POSTGRES_IMAGE || 'postgres:16-alpine',
+    redis: process.env.OPC_PREVIEW_REDIS_IMAGE || 'redis:7.4-alpine',
+}
+const databaseName = 'opc_preview'
+
+export interface CandidateService {
+    kind: keyof typeof candidateServiceImages
+    port: number
+    password?: string
+}
+
+export interface CandidateSandbox {
+    services: CandidateService[]
+    mounts: string[]
+}
 
 export interface CandidateRequest {
     method: string
@@ -21,8 +42,7 @@ export interface CandidateResponse {
     body: string
 }
 
-// Run the relay in the candidate's network namespace. The only peer the
-// application's process can reach is loopback, and the relay has no host mounts.
+// Both the probe and scratch services share a loopback-only network namespace.
 const probeScript = `
 const http = require('node:http');
 let input = '';
@@ -86,33 +106,19 @@ async function ownedContainer(
     }
 }
 
-export async function startDeliveryCandidate(
+async function ensureCandidateContainer(
     docker: Docker,
-    app: string,
-    receipt: string,
-    image: string,
-    env: IAppEnvVar[]
+    name: string,
+    labels: Record<string, string>,
+    spec: Docker.ContainerCreateOptions
 ) {
-    const name = candidateName(receipt)
-    const labels = { [candidateLabel]: receipt, [appLabel]: app }
     let existing = await ownedContainer(docker, name, labels)
     if (!existing) {
         try {
             await docker.createContainer({
+                ...spec,
                 name,
-                Image: image,
-                Env: env.map(({ key, value }) => `${key}=${value}`),
-                Labels: labels,
-                HostConfig: {
-                    NetworkMode: 'none',
-                    CapDrop: ['ALL'],
-                    SecurityOpt: ['no-new-privileges:true'],
-                    PidsLimit: 512,
-                    LogConfig: {
-                        Type: 'json-file',
-                        Config: { 'max-size': '2m', 'max-file': '1' },
-                    },
-                },
+                Labels: { ...spec.Labels, ...labels },
             })
         } catch (error) {
             if (dockerStatus(error) !== 409) throw error
@@ -121,8 +127,8 @@ export async function startDeliveryCandidate(
     }
     if (
         !existing ||
-        existing.info.Config.Image !== image ||
-        existing.info.HostConfig.NetworkMode !== 'none'
+        existing.info.Config.Image !== spec.Image ||
+        existing.info.HostConfig.NetworkMode !== spec.HostConfig?.NetworkMode
     ) {
         throw new Error('Delivery candidate does not match its isolated image')
     }
@@ -133,6 +139,161 @@ export async function startDeliveryCandidate(
             if (dockerStatus(error) !== 304) throw error
         }
     }
+    return existing
+}
+
+async function candidateProbeContainer(
+    docker: Docker,
+    name: string,
+    labels: Record<string, string>,
+    networkMode: string
+) {
+    const self = await docker.getContainer(hostname()).inspect()
+    return ensureCandidateContainer(docker, name, labels, {
+        Image: self.Image,
+        Entrypoint: ['node'],
+        Cmd: ['-e', 'setInterval(() => {}, 2147483647)'],
+        HostConfig: {
+            NetworkMode: networkMode,
+            CapDrop: ['ALL'],
+            ReadonlyRootfs: true,
+            SecurityOpt: ['no-new-privileges:true'],
+        },
+    })
+}
+
+async function startCandidateService(
+    docker: Docker,
+    name: string,
+    labels: Record<string, string>,
+    networkMode: string,
+    service: CandidateService
+) {
+    const port = String(service.port)
+    const postgres = service.kind === 'postgres'
+    const env = postgres
+        ? [
+              `POSTGRES_DB=${databaseName}`,
+              `POSTGRES_USER=${databaseName}`,
+              `POSTGRES_PASSWORD=${service.password}`,
+          ]
+        : service.password
+          ? [`REDISCLI_AUTH=${service.password}`]
+          : []
+    const command = postgres
+        ? ['postgres', '-c', 'listen_addresses=127.0.0.1', '-p', port]
+        : [
+              'redis-server',
+              '--bind',
+              '127.0.0.1',
+              '--port',
+              port,
+              ...(service.password ? ['--requirepass', service.password] : []),
+          ]
+    const check = postgres
+        ? [
+              'pg_isready',
+              '-h',
+              '127.0.0.1',
+              '-p',
+              port,
+              '-d',
+              databaseName,
+              '-U',
+              databaseName,
+          ]
+        : ['redis-cli', '-h', '127.0.0.1', '-p', port, 'ping']
+    const instance = await ensureCandidateContainer(docker, name, labels, {
+        Image: candidateServiceImages[service.kind],
+        Cmd: command,
+        Env: env,
+        HostConfig: {
+            NetworkMode: networkMode,
+            SecurityOpt: ['no-new-privileges:true'],
+            Memory: 512 * 1024 * 1024,
+            PidsLimit: 128,
+        },
+        Healthcheck: {
+            Test: ['CMD', ...check],
+            Interval: 1_000_000_000,
+            Timeout: 1_000_000_000,
+            Retries: 45,
+        },
+    })
+    const deadline = Date.now() + 60_000
+    while (Date.now() < deadline) {
+        const { State } = await instance.container.inspect()
+        if (State.Health?.Status === 'healthy') return
+        if (!State.Running || State.Health?.Status === 'unhealthy') break
+        await delay(500)
+    }
+    throw new Error(
+        `Temporary ${service.kind} did not become ready on port ${port}`
+    )
+}
+
+export async function startDeliveryCandidate(
+    docker: Docker,
+    app: string,
+    receipt: string,
+    image: string,
+    env: IAppEnvVar[],
+    sandbox: CandidateSandbox
+) {
+    const name = candidateName(receipt)
+    const labels = { [candidateLabel]: receipt, [appLabel]: app }
+    const usesSandbox = sandbox.services.length > 0 || sandbox.mounts.length > 0
+    const config = createHash('sha256')
+        .update(JSON.stringify({ env, sandbox }))
+        .digest('hex')
+    const candidateLabels = usesSandbox
+        ? { ...labels, [configLabel]: config }
+        : labels
+    let networkMode = 'none'
+    if (sandbox.services.length > 0) {
+        const holder = await candidateProbeContainer(
+            docker,
+            `${name}-sandbox`,
+            { ...labels, [componentLabel]: 'sandbox', [configLabel]: config },
+            'none'
+        )
+        networkMode = `container:${holder.info.Id}`
+        const provisioned = await Promise.allSettled(
+            sandbox.services.map((service) =>
+                startCandidateService(
+                    docker,
+                    `${name}-service-${service.port}`,
+                    {
+                        ...labels,
+                        [componentLabel]: 'service',
+                        [configLabel]: config,
+                    },
+                    networkMode,
+                    service
+                )
+            )
+        )
+        const failed = provisioned.find(
+            (result) => result.status === 'rejected'
+        )
+        if (failed) throw failed.reason
+    }
+    await ensureCandidateContainer(docker, name, candidateLabels, {
+        Image: image,
+        Labels: { [componentLabel]: 'app' },
+        Env: env.map(({ key, value }) => `${key}=${value}`),
+        Volumes: Object.fromEntries(sandbox.mounts.map((path) => [path, {}])),
+        HostConfig: {
+            NetworkMode: networkMode,
+            CapDrop: ['ALL'],
+            SecurityOpt: ['no-new-privileges:true'],
+            PidsLimit: 512,
+            LogConfig: {
+                Type: 'json-file',
+                Config: { 'max-size': '2m', 'max-file': '1' },
+            },
+        },
+    })
 }
 
 export async function stopDeliveryCandidate(
@@ -147,7 +308,29 @@ export async function stopDeliveryCandidate(
         [relayLabel]: 'true',
     })
     const candidate = await ownedContainer(docker, name, labels)
-    for (const item of [relay, candidate]) {
+    const holder = await ownedContainer(docker, `${name}-sandbox`, {
+        ...labels,
+        [componentLabel]: 'sandbox',
+    })
+    const services = await docker.listContainers({
+        all: true,
+        filters: {
+            label: [
+                `${candidateLabel}=${receipt}`,
+                `${appLabel}=${app}`,
+                `${componentLabel}=service`,
+            ],
+        },
+    })
+    const dependencies = await Promise.all(
+        services.map(({ Id }) =>
+            ownedContainer(docker, Id, {
+                ...labels,
+                [componentLabel]: 'service',
+            })
+        )
+    )
+    for (const item of [relay, candidate, ...dependencies, holder]) {
         if (!item) continue
         try {
             await item.container.remove({ force: true, v: true })
@@ -193,46 +376,30 @@ export async function probeDeliveryCandidate(
     const name = candidateName(receipt)
     const labels = { [candidateLabel]: receipt, [appLabel]: app }
     const candidate = await ownedContainer(docker, name, labels)
-    if (
-        !candidate?.info.State.Running ||
-        candidate.info.HostConfig.NetworkMode !== 'none'
-    ) {
+    if (!candidate?.info.State.Running) {
         throw new Error('Isolated delivery candidate is not running')
     }
-    const relayName = `${name}-relay`
-    const relayLabels = { ...labels, [relayLabel]: 'true' }
-    const networkMode = `container:${candidate.info.Id}`
-    let relay = await ownedContainer(docker, relayName, relayLabels)
-    if (!relay) {
-        const self = await docker.getContainer(hostname()).inspect()
-        try {
-            await docker.createContainer({
-                name: relayName,
-                Image: self.Image,
-                Entrypoint: ['node'],
-                Cmd: ['-e', 'setInterval(() => {}, 2147483647)'],
-                Labels: relayLabels,
-                HostConfig: {
-                    NetworkMode: networkMode,
-                    CapDrop: ['ALL'],
-                    ReadonlyRootfs: true,
-                    SecurityOpt: ['no-new-privileges:true'],
-                },
-            })
-        } catch (error) {
-            if (dockerStatus(error) !== 409) throw error
-        }
-        relay = await ownedContainer(docker, relayName, relayLabels)
-    }
-    if (!relay || relay.info.HostConfig.NetworkMode !== networkMode) {
-        throw new Error('Isolated candidate relay is not available')
-    }
-    if (!relay.info.State.Running) {
-        try {
-            await relay.container.start()
-        } catch (error) {
-            if (dockerStatus(error) !== 304) throw error
-        }
+    const mode = candidate.info.HostConfig.NetworkMode
+    const relay =
+        mode === 'none'
+            ? await candidateProbeContainer(
+                  docker,
+                  `${name}-relay`,
+                  { ...labels, [relayLabel]: 'true' },
+                  `container:${candidate.info.Id}`
+              )
+            : await ownedContainer(docker, `${name}-sandbox`, {
+                  ...labels,
+                  [componentLabel]: 'sandbox',
+              })
+    if (
+        !relay ||
+        (mode !== 'none' &&
+            (!relay.info.State.Running ||
+                relay.info.HostConfig.NetworkMode !== 'none' ||
+                mode !== `container:${relay.info.Id}`))
+    ) {
+        throw new Error('Isolated candidate network namespace is not available')
     }
     const exec = await relay.container.exec({
         Cmd: ['node', '-e', probeScript],
