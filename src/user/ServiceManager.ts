@@ -74,6 +74,7 @@ class ServiceManager {
     }
 
     private activeOrScheduledBuilds: IHashMapGeneric<boolean>
+    private readonly activeCandidateBuilds = new Map<string, string>()
     private pendingPreStagedDefinitions: IHashMapGeneric<IAppDef>
     private buildLogsManager: BuildLogsManager
     private queuedBuilds: QueuedBuild[]
@@ -198,6 +199,9 @@ class ServiceManager {
 
         self.activeOrScheduledBuilds[appName] = true
         self.buildLogsManager.getAppBuildLogs(appName).clear()
+        if (source.buildReceipt) {
+            self.activeCandidateBuilds.set(appName, source.buildReceipt)
+        }
 
         function advanceBuildQueueOnce() {
             if (hasAdvancedBuildQueue) {
@@ -206,11 +210,6 @@ class ServiceManager {
 
             hasAdvancedBuildQueue = true
             self.onBuildFinished(appName)
-        }
-
-        function candidateBuildLog() {
-            const lines: string[] = self.getBuildStatus(appName).logs.lines
-            return lines.join('\n').trim().slice(-12_000)
         }
 
         return Promise.resolve() //
@@ -244,7 +243,7 @@ class ServiceManager {
                         .getAppsDataStore()
                         .savePreparedBuild(appName, deployedVersion, {
                             image: builtImage.imageName,
-                            log: candidateBuildLog(),
+                            log: self.buildLogTail(appName),
                         })
                 }
                 return dataStore
@@ -283,7 +282,7 @@ class ServiceManager {
                                   .getAppsDataStore()
                                   .savePreparedBuild(appName, deployedVersion, {
                                       error: 'Candidate image build failed',
-                                      log: candidateBuildLog(),
+                                      log: self.buildLogTail(appName),
                                   })
                     return record
                         .finally(advanceBuildQueueOnce)
@@ -313,6 +312,7 @@ class ServiceManager {
 
     onBuildFinished(appName: string) {
         const self = this
+        self.activeCandidateBuilds.delete(appName)
         self.activeOrScheduledBuilds[appName] = false
 
         Promise.resolve().then(function () {
@@ -980,6 +980,16 @@ class ServiceManager {
             isBuildFailed:
                 self.buildLogsManager.getAppBuildLogs(appName).isBuildFailed,
         }
+    }
+
+    getCandidateBuildLog(appName: string, receipt: string): string | undefined {
+        if (this.activeCandidateBuilds.get(appName) !== receipt) return
+        return this.buildLogTail(appName)
+    }
+
+    private buildLogTail(appName: string) {
+        const lines: string[] = this.getBuildStatus(appName).logs.lines
+        return lines.join('\n').trim().slice(-12_000)
     }
 
     getAppsRuntime(): Promise<AppsRuntimeResponse> {

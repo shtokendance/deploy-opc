@@ -60,14 +60,15 @@ router.get('/:appName/', function (req, res, next) {
 })
 
 router.get('/:appName/builds/:receipt', function (req, res) {
-    const { dataStore } = InjectionExtractor.extractUserFromInjected(res).user
+    const { dataStore, serviceManager } =
+        InjectionExtractor.extractUserFromInjected(res).user
+    const { appName, receipt } = req.params
     return dataStore
         .getAppsDataStore()
-        .getAppDefinition(req.params.appName)
+        .getAppDefinition(appName)
         .then(function (app) {
             const build = app.versions.find(
-                (version) =>
-                    version.preparedBuild?.receipt === req.params.receipt
+                (version) => version.preparedBuild?.receipt === receipt
             )?.preparedBuild
             const reply = new BaseApi(
                 ApiStatusCodes.STATUS_OK,
@@ -82,7 +83,13 @@ router.get('/:appName/builds/:receipt', function (req, res) {
                             : 'building',
                       image: build.image,
                       error: build.error,
-                      log: build.log,
+                      log:
+                          build.image || build.error
+                              ? build.log
+                              : serviceManager.getCandidateBuildLog(
+                                    appName,
+                                    receipt
+                                ),
                   }
                 : { status: 'unknown' }
             res.send(reply)

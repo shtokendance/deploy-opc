@@ -1,6 +1,9 @@
 import fs = require('fs-extra')
 import os = require('os')
 import path = require('path')
+import express = require('express')
+import { once } from 'node:events'
+import appDataRouter from '../src/routes/user/apps/appdata/AppDataRouter'
 import ImageMaker, { BuildLogsManager } from '../src/user/ImageMaker'
 import ServiceManager from '../src/user/ServiceManager'
 import DiskCleanupManager from '../src/user/system/DiskCleanupManager'
@@ -17,6 +20,106 @@ function deferred<T>() {
 describe('App upgrade, rollback, and cleanup regressions', () => {
     afterEach(() => {
         jest.restoreAllMocks()
+    })
+
+    test('candidate build receipt streams only its own logs and retains the completed output', async () => {
+        const appName = 'demo'
+        const receipt = 'candidate-2'
+        const started = deferred<void>()
+        const image = deferred<{ imageName: string }>()
+        const preparedBuild = { receipt }
+        const versions = [
+            {
+                preparedBuild: {
+                    receipt: 'candidate-1',
+                    image: 'demo:1',
+                    log: 'Old build',
+                },
+            },
+            { preparedBuild },
+        ]
+        const appsDataStore = {
+            createNewVersion: jest.fn().mockResolvedValue(2),
+            getAppDefinition: jest.fn().mockResolvedValue({ versions }),
+            savePreparedBuild: jest.fn((_appName, _version, result) => {
+                Object.assign(preparedBuild, result)
+            }),
+        }
+        const dataStore = {
+            getNameSpace: () => 'captain',
+            getAppsDataStore: () => appsDataStore,
+            getRegistriesDataStore: () => ({}),
+        }
+        const manager = new ServiceManager(
+            dataStore as unknown as ConstructorParameters<
+                typeof ServiceManager
+            >[0],
+            {} as ConstructorParameters<typeof ServiceManager>[1],
+            {} as ConstructorParameters<typeof ServiceManager>[2],
+            {} as ConstructorParameters<typeof ServiceManager>[3],
+            {} as ConstructorParameters<typeof ServiceManager>[4],
+            {} as ConstructorParameters<typeof ServiceManager>[5]
+        )
+        const logs = new BuildLogsManager()
+        Object.assign(manager, {
+            buildLogsManager: logs,
+            imageMaker: {
+                ensureImage: () => {
+                    logs.getAppBuildLogs(appName).log('Step 1: loading context')
+                    started.resolve()
+                    return image.promise
+                },
+            },
+        })
+        const app = express()
+        app.use((_req, res, next) => {
+            res.locals.user = { dataStore, serviceManager: manager }
+            next()
+        })
+        app.use(appDataRouter)
+        const server = app.listen(0, '127.0.0.1')
+        await once(server, 'listening')
+        const address = server.address()
+        if (!address || typeof address === 'string')
+            throw new Error('missing test server address')
+        const read = async (id: string) => {
+            const response = await fetch(
+                `http://127.0.0.1:${address.port}/${appName}/builds/${id}`
+            )
+            expect(response.status).toBe(200)
+            return (await response.json()).data
+        }
+        const build = manager.scheduleDeployNewVersion(appName, {
+            buildReceipt: receipt,
+        })
+        try {
+            await started.promise
+            expect(await read(receipt)).toEqual({
+                status: 'building',
+                log: 'Step 1: loading context',
+            })
+            expect(await read('candidate-1')).toEqual({
+                status: 'built',
+                image: 'demo:1',
+                log: 'Old build',
+            })
+            expect(await read('unrelated')).toEqual({ status: 'unknown' })
+            logs.getAppBuildLogs(appName).log('Step 2: compiling')
+            expect((await read(receipt)).log).toContain('Step 2: compiling')
+            image.resolve({ imageName: 'demo:2' })
+            await build
+            expect(await read(receipt)).toEqual({
+                status: 'built',
+                image: 'demo:2',
+                log: 'Step 1: loading context\nStep 2: compiling',
+            })
+        } finally {
+            image.resolve({ imageName: 'demo:2' })
+            await Promise.allSettled([
+                build,
+                new Promise<void>((resolve) => server.close(() => resolve())),
+            ])
+        }
     })
 
     test('ImageMaker.ensureImage reuses local image without calling pullImage', async () => {
