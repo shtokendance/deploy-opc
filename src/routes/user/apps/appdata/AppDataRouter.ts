@@ -3,6 +3,7 @@ import ApiStatusCodes from '../../../../api/ApiStatusCodes'
 import BaseApi from '../../../../api/BaseApi'
 import { uploadCaptainDefinitionContent as uploadCaptainDefinitionContentHandler } from '../../../../handlers/users/apps/appdata/AppDataHandler'
 import InjectionExtractor from '../../../../injection/InjectionExtractor'
+import fs from 'fs-extra'
 import multer = require('multer')
 
 const TEMP_UPLOAD = 'temp_upload/'
@@ -54,6 +55,93 @@ router.get('/:appName/', function (req, res, next) {
         })
         .catch(ApiStatusCodes.createCatcher(res))
 })
+
+router.get('/:appName/builds/:receipt', function (req, res) {
+    const { dataStore } = InjectionExtractor.extractUserFromInjected(res).user
+    return dataStore
+        .getAppsDataStore()
+        .getAppDefinition(req.params.appName)
+        .then(function (app) {
+            const build = app.versions.find(
+                (version) =>
+                    version.preparedBuild?.receipt === req.params.receipt
+            )?.preparedBuild
+            const reply = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'Prepared build receipt'
+            )
+            reply.data = build
+                ? {
+                      status: build.image
+                          ? 'built'
+                          : build.error
+                            ? 'failed'
+                            : 'building',
+                      image: build.image,
+                      error: build.error,
+                      log: build.log,
+                  }
+                : { status: 'unknown' }
+            res.send(reply)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
+router.post<{ appName: string; receipt: string }>(
+    '/:appName/builds/:receipt',
+    upload.single('sourceFile'),
+    async function (req, res) {
+        const { dataStore, serviceManager } =
+            InjectionExtractor.extractUserFromInjected(res).user
+        const { appName, receipt } = req.params
+        const file = req.file?.path
+        let queued = false
+        try {
+            const app = await dataStore
+                .getAppsDataStore()
+                .getAppDefinition(appName)
+            if (
+                app.versions.some(
+                    (version) => version.preparedBuild?.receipt === receipt
+                )
+            ) {
+                res.send(
+                    new BaseApi(
+                        ApiStatusCodes.STATUS_OK_DEPLOY_STARTED,
+                        'Candidate build already recorded'
+                    )
+                )
+                return
+            }
+            if (serviceManager.isAppBuilding(appName)) {
+                throw ApiStatusCodes.createError(
+                    ApiStatusCodes.ILLEGAL_OPERATION,
+                    'An application build is already in progress'
+                )
+            }
+            await uploadCaptainDefinitionContentHandler(
+                {
+                    appName,
+                    isDetachedBuild: true,
+                    uploadedTarPathSource: file,
+                    buildReceipt: receipt,
+                },
+                serviceManager
+            )
+            queued = true
+            res.send(
+                new BaseApi(
+                    ApiStatusCodes.STATUS_OK_DEPLOY_STARTED,
+                    'Candidate build scheduled without deployment'
+                )
+            )
+        } catch (error) {
+            ApiStatusCodes.createCatcher(res)(error)
+        } finally {
+            if (file && !queued) await fs.remove(file).catch(() => {})
+        }
+    }
+)
 
 router.post('/:appName/', function (req, res, next) {
     const dataStore =

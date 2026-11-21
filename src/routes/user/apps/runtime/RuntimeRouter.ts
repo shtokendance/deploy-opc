@@ -44,4 +44,44 @@ router.get('/:appName', function (req, res, next) {
         .catch(ApiStatusCodes.createCatcher(res))
 })
 
+router.get('/:appName/write-hold', function (req, res) {
+    const { serviceManager } =
+        InjectionExtractor.extractUserFromInjected(res).user
+    return serviceManager
+        .isApplicationWriteHeld(req.params.appName)
+        .then(function (held) {
+            const reply = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'Application write hold state'
+            )
+            reply.data = { held }
+            res.send(reply)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
+router.post('/:appName/write-hold', function (req, res) {
+    const { serviceManager } =
+        InjectionExtractor.extractUserFromInjected(res).user
+    if (typeof req.body?.hold !== 'boolean') {
+        return res.send(
+            new BaseApi(
+                ApiStatusCodes.ILLEGAL_PARAMETER,
+                'hold must be boolean'
+            )
+        )
+    }
+    return serviceManager
+        .setApplicationWriteHold(req.params.appName, req.body.hold)
+        .then(function () {
+            res.send(
+                new BaseApi(
+                    ApiStatusCodes.STATUS_OK,
+                    'Application replica adjustment requested'
+                )
+            )
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
 export default router

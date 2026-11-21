@@ -240,6 +240,47 @@ class DockerApi {
         return service.Spec.TaskTemplate.ContainerSpec?.Mounts || []
     }
 
+    async setApplicationReplicas(serviceName: string, replicas: number) {
+        const service = this.dockerode.getService(serviceName)
+        const current = await service.inspect()
+        if (
+            current.Spec.Labels?.[CAPROVER_MANAGED_SERVICE_LABEL] !== 'true' ||
+            !current.Spec.Mode?.Replicated
+        ) {
+            throw new Error(
+                'The application service is not a managed replicated service'
+            )
+        }
+        await service.update({
+            ...current.Spec,
+            Mode: { Replicated: { Replicas: replicas } },
+            version: current.Version.Index,
+        })
+    }
+
+    async isApplicationWriteHeld(serviceName: string) {
+        const current = await this.dockerode.getService(serviceName).inspect()
+        if (
+            current.Spec.Labels?.[CAPROVER_MANAGED_SERVICE_LABEL] !== 'true' ||
+            current.Spec.Mode?.Replicated?.Replicas !== 0
+        )
+            return false
+        const tasks: { Status: { State: string } }[] =
+            await this.dockerode.listTasks({
+                filters: { service: [current.ID] },
+            })
+        return tasks.every((task) =>
+            [
+                'shutdown',
+                'complete',
+                'failed',
+                'rejected',
+                'remove',
+                'orphaned',
+            ].includes(task.Status.State)
+        )
+    }
+
     async getRunningApplicationBinds(serviceName: string, localNodeId: string) {
         const service = await this.dockerode.getService(serviceName).inspect()
         const tasks: {

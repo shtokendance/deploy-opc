@@ -637,7 +637,28 @@ class AppsDataStore {
             })
     }
 
-    createNewVersion(appName: string) {
+    savePreparedBuild(
+        appName: string,
+        version: number,
+        result: ({ image: string } | { error: string }) & { log: string }
+    ) {
+        const self = this
+        return this.getAppDefinition(appName).then(function (app) {
+            const build = app.versions.find(
+                (item) => item.version === version
+            )?.preparedBuild
+            if (!build) {
+                throw ApiStatusCodes.createError(
+                    ApiStatusCodes.STATUS_ERROR_GENERIC,
+                    'Could not find the prepared build'
+                )
+            }
+            Object.assign(build, result)
+            return self.saveApp(appName, app)
+        })
+    }
+
+    createNewVersion(appName: string, buildReceipt?: string) {
         if (!appName) {
             throw ApiStatusCodes.createError(
                 ApiStatusCodes.STATUS_ERROR_GENERIC,
@@ -647,6 +668,9 @@ class AppsDataStore {
         const self = this
 
         return this.getAppDefinition(appName).then(function (app) {
+            const active = app.versions.find(
+                (version) => version.version === app.deployedVersion
+            )
             // Drop older versions
             app.versions = Utils.dropFirstElements(
                 app.versions,
@@ -654,6 +678,12 @@ class AppsDataStore {
             )
 
             const versions = app.versions
+            if (
+                active &&
+                !versions.some((version) => version.version === active.version)
+            ) {
+                versions.unshift(active)
+            }
 
             let newVersionIndex = versions.length
 
@@ -674,6 +704,9 @@ class AppsDataStore {
                 version: newVersionIndex,
                 gitHash: undefined,
                 timeStamp: new Date().toISOString(),
+                ...(buildReceipt
+                    ? { preparedBuild: { receipt: buildReceipt } }
+                    : {}),
             })
 
             return self.saveApp(appName, app).then(function () {
