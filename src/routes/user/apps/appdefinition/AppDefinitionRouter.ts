@@ -172,7 +172,7 @@ router.post('/enablecustomdomainssl/', function (req, res, next) {
         .catch(ApiStatusCodes.createCatcher(res))
 })
 
-router.post('/register/', function (req, res, next) {
+router.post(['/register/', '/register-candidate/'], function (req, res, next) {
     const dataStore =
         InjectionExtractor.extractUserFromInjected(res).user.dataStore
     const serviceManager =
@@ -182,9 +182,18 @@ router.post('/register/', function (req, res, next) {
     const projectId = `${req.body.projectId || ''}`
     const hasPersistentData = !!req.body.hasPersistentData
     const isDetachedBuild = !!req.query.detached
+    const candidateOnly = req.path
+        .toLowerCase()
+        .startsWith('/register-candidate')
 
     return registerAppDefinition(
-        { appName, projectId, hasPersistentData, isDetachedBuild },
+        {
+            appName,
+            projectId,
+            hasPersistentData,
+            isDetachedBuild,
+            candidateOnly,
+        },
         dataStore,
         serviceManager
     )

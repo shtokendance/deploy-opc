@@ -21,6 +21,7 @@ export interface RegisterAppDefinitionParams {
     projectId: string
     hasPersistentData: boolean
     isDetachedBuild: boolean
+    candidateOnly?: boolean
 }
 
 export async function registerAppDefinition(
@@ -28,7 +29,13 @@ export async function registerAppDefinition(
     dataStore: DataStore,
     serviceManager: ServiceManager
 ): Promise<BaseHandlerResult> {
-    const { appName, projectId, hasPersistentData, isDetachedBuild } = params
+    const {
+        appName,
+        projectId,
+        hasPersistentData,
+        isDetachedBuild,
+        candidateOnly = false,
+    } = params
     let appCreated = false
 
     Logger.d(`Registering app started: ${appName}`)
@@ -43,9 +50,17 @@ export async function registerAppDefinition(
         // Register the app definition
         await dataStore
             .getAppsDataStore()
-            .registerAppDefinition(appName, projectId, hasPersistentData)
+            .registerAppDefinition(
+                appName,
+                projectId,
+                hasPersistentData,
+                candidateOnly
+            )
 
         appCreated = true
+        if (candidateOnly) {
+            return { message: 'Isolated candidate app definition saved' }
+        }
 
         // Create captain definition content
         const captainDefinitionContent: ICaptainDefinition = {

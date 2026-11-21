@@ -2,6 +2,7 @@ import fs = require('fs-extra')
 import ApiStatusCodes from '../api/ApiStatusCodes'
 import DataStore from '../datastore/DataStore'
 import DockerApi, { IDockerUpdateOrders } from '../docker/DockerApi'
+import { CandidateRequest } from '../docker/DeliveryCandidate'
 import {
     AppDeployTokenConfig,
     IAppDef,
@@ -225,7 +226,7 @@ class ServiceManager {
                     .getAppDefinition(appName)
                     .then(function (app) {
                         const envVars = source.buildReceipt
-                            ? []
+                            ? (source.buildArgs ?? [])
                             : app.envVars || []
 
                         return self.imageMaker.ensureImage(
@@ -1046,12 +1047,63 @@ class ServiceManager {
     }
 
     async setApplicationWriteHold(appName: string, hold: boolean) {
+        if (this.isAppBuilding(appName)) {
+            throw new Error(
+                'The application deployment must settle before changing its write hold'
+            )
+        }
         const apps = this.dataStore.getAppsDataStore()
         const app = await apps.getAppDefinition(appName)
         await this.dockerApi.setApplicationReplicas(
             apps.getServiceName(appName, !!app.isLegacyAppName),
-            hold ? 0 : app.instanceCount
+            hold ? 0 : app.instanceCount,
+            hold
         )
+    }
+
+    async startDeliveryCandidate(
+        appName: string,
+        receipt: string,
+        env: IAppEnvVar[]
+    ) {
+        const app = await this.dataStore
+            .getAppsDataStore()
+            .getAppDefinition(appName)
+        const image = app.versions.find(
+            (version) => version.preparedBuild?.receipt === receipt
+        )?.preparedBuild?.image
+        if (!image)
+            throw new Error(
+                'An image from the requested delivery build is required'
+            )
+        await this.dockerApi.startDeliveryCandidate(
+            appName,
+            receipt,
+            image,
+            env
+        )
+    }
+
+    probeDeliveryCandidate(
+        appName: string,
+        receipt: string,
+        port: number,
+        request: CandidateRequest
+    ) {
+        return this.dockerApi.probeDeliveryCandidate(
+            appName,
+            receipt,
+            port,
+            request
+        )
+    }
+
+    stopDeliveryCandidate(appName: string, receipt: string) {
+        return this.dockerApi.stopDeliveryCandidate(appName, receipt)
+    }
+
+    getDeliveryCandidateLogs(appName: string, receipt: string) {
+        return this.dockerApi.getDeliveryCandidateLogs(appName, receipt)
     }
 
     async isApplicationWriteHeld(appName: string) {

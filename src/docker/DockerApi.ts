@@ -36,11 +36,27 @@ import EnvVars from '../utils/EnvVars'
 import Logger from '../utils/Logger'
 import Utils from '../utils/Utils'
 import Dockerode = require('dockerode')
+import {
+    CandidateRequest,
+    getDeliveryCandidateLogs,
+    probeDeliveryCandidate,
+    startDeliveryCandidate,
+    stopDeliveryCandidate,
+} from './DeliveryCandidate'
 // @ts-expect-error "TODO"
 import dockerodeUtils = require('dockerode/lib/util')
 
 const Base64 = Base64Provider.Base64
 const CAPROVER_MANAGED_SERVICE_LABEL = 'com.caprover.managed'
+
+function isMissingService(error: unknown) {
+    return (
+        typeof error === 'object' &&
+        error !== null &&
+        'statusCode' in error &&
+        error.statusCode === 404
+    )
+}
 
 export abstract class IDockerUpdateOrders {
     public static readonly AUTO = 'auto'
@@ -125,6 +141,38 @@ class DockerApi {
 
     static get() {
         return dockerApiInstance
+    }
+
+    startDeliveryCandidate(
+        app: string,
+        receipt: string,
+        image: string,
+        env: IAppEnvVar[]
+    ) {
+        return startDeliveryCandidate(this.dockerode, app, receipt, image, env)
+    }
+
+    stopDeliveryCandidate(app: string, receipt: string) {
+        return stopDeliveryCandidate(this.dockerode, app, receipt)
+    }
+
+    getDeliveryCandidateLogs(app: string, receipt: string) {
+        return getDeliveryCandidateLogs(this.dockerode, app, receipt)
+    }
+
+    probeDeliveryCandidate(
+        app: string,
+        receipt: string,
+        port: number,
+        request: CandidateRequest
+    ) {
+        return probeDeliveryCandidate(
+            this.dockerode,
+            app,
+            receipt,
+            port,
+            request
+        )
     }
 
     ensureSwarmExists() {
@@ -240,9 +288,17 @@ class DockerApi {
         return service.Spec.TaskTemplate.ContainerSpec?.Mounts || []
     }
 
-    async setApplicationReplicas(serviceName: string, replicas: number) {
+    async setApplicationReplicas(
+        serviceName: string,
+        replicas: number,
+        absentIsHeld = false
+    ) {
         const service = this.dockerode.getService(serviceName)
-        const current = await service.inspect()
+        const current = await service.inspect().catch((error: unknown) => {
+            if (absentIsHeld && isMissingService(error)) return undefined
+            throw error
+        })
+        if (!current) return
         if (
             current.Spec.Labels?.[CAPROVER_MANAGED_SERVICE_LABEL] !== 'true' ||
             !current.Spec.Mode?.Replicated
@@ -259,7 +315,14 @@ class DockerApi {
     }
 
     async isApplicationWriteHeld(serviceName: string) {
-        const current = await this.dockerode.getService(serviceName).inspect()
+        const current = await this.dockerode
+            .getService(serviceName)
+            .inspect()
+            .catch((error: unknown) => {
+                if (isMissingService(error)) return undefined
+                throw error
+            })
+        if (!current) return true
         if (
             current.Spec.Labels?.[CAPROVER_MANAGED_SERVICE_LABEL] !== 'true' ||
             current.Spec.Mode?.Replicated?.Replicas !== 0
@@ -512,11 +575,9 @@ class DockerApi {
 
         return Promise.resolve()
             .then(function () {
-                const buildargs: IHashMapGeneric<string> = {}
-
-                envVars.forEach((env) => {
-                    buildargs[env.key] = env.value
-                })
+                const buildargs = Object.fromEntries(
+                    envVars.map((env) => [env.key, env.value])
+                )
 
                 if (envVars.length > 0) {
                     buildLogs.log(
