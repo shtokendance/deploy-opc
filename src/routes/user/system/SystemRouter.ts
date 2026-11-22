@@ -12,6 +12,7 @@ import { AutomatedCleanupConfigsCleaner } from '../../../models/AutomatedCleanup
 import {
     listApplicationVolumeRoots,
     prepareApplicationVolumePath,
+    removeLocalApplicationVolumeDirectory,
 } from '../../../user/system/ApplicationVolumePaths'
 import CaptainManager from '../../../user/system/CaptainManager'
 import VersionManager from '../../../user/system/VersionManager'
@@ -344,6 +345,49 @@ router.post('/application-storage/paths/', function (req, res) {
                     : error.message
             res.send(new BaseApi(ApiStatusCodes.STATUS_ERROR_GENERIC, message))
         })
+})
+
+router.delete('/application-storage/paths/', function (req, res, next) {
+    const { root, node_id, directory } = req.body || {}
+    if (
+        typeof root !== 'string' ||
+        root.length > 255 ||
+        typeof node_id !== 'string' ||
+        typeof directory !== 'string'
+    ) {
+        res.send(
+            new BaseApi(
+                ApiStatusCodes.STATUS_ERROR_GENERIC,
+                'Invalid storage path request'
+            )
+        )
+        return
+    }
+    const docker = DockerApi.get()
+    Promise.resolve()
+        .then(async function () {
+            if (node_id !== CaptainManager.get().getMyNodeId()) {
+                throw new Error(
+                    'Storage node does not match the active Deploy node'
+                )
+            }
+            const mounts = await docker.getServiceMounts(
+                CaptainConstants.captainServiceName
+            )
+            await removeLocalApplicationVolumeDirectory(
+                root,
+                directory,
+                mounts,
+                () => docker.getApplicationStorageBindSources(root)
+            )
+            res.send(
+                new BaseApi(
+                    ApiStatusCodes.STATUS_OK,
+                    'Application storage removed'
+                )
+            )
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
 })
 
 router.get('/diskusage/', function (req, res, next) {

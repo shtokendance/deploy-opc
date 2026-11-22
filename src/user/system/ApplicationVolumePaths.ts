@@ -276,3 +276,68 @@ export async function prepareApplicationVolumePath(
         if (created && leaf && !isOSS) await fs.chmod(target, 0o777)
     }
 }
+
+export async function removeLocalApplicationVolumeDirectory(
+    root: string,
+    directory: string,
+    serviceMounts: Mount[],
+    readReferencedSources: () => Promise<string[]>,
+    options?: { configuredRoots?: string; mountInfoText?: string }
+) {
+    if (
+        !/^[a-z0-9][a-z0-9-]{0,62}-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(
+            directory
+        )
+    ) {
+        throw new Error('Invalid application volume directory')
+    }
+    const mountEntries = parseMountInfo(
+        options?.mountInfoText ??
+            (await fs.readFile('/proc/self/mountinfo', 'utf8'))
+    )
+    const { filesystem, rootStat } = await resolveVerifiedRoot(
+        root,
+        serviceMounts,
+        mountEntries,
+        parseConfiguredRoots(options?.configuredRoots)
+    )
+    if (filesystem.type.startsWith('fuse')) {
+        throw new Error('Storage root is not a local filesystem')
+    }
+    const target = path.posix.join(root, directory)
+    const stat = await fs
+        .lstat(target)
+        .catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return undefined
+            throw error
+        })
+    if (!stat) return
+    if (!stat.isDirectory() || stat.dev !== rootStat.dev) {
+        throw new Error('Target is not a local application directory')
+    }
+    if (
+        mountEntries.some(
+            (entry) =>
+                entry.target === target || entry.target.startsWith(target + '/')
+        )
+    ) {
+        throw new Error('Application directory contains a mount point')
+    }
+    for (const raw of await readReferencedSources()) {
+        if (!path.posix.isAbsolute(raw)) continue
+        const source = path.posix.resolve(raw)
+        const resolved = await fs.realpath(source).catch(() => source)
+        if (
+            [source, resolved].some(
+                (entry) =>
+                    entry === '/' ||
+                    entry === target ||
+                    entry.startsWith(target + '/') ||
+                    target.startsWith(entry + '/')
+            )
+        ) {
+            throw new Error('Application storage is still in use by Docker')
+        }
+    }
+    await fs.rm(target, { recursive: true, force: true })
+}
