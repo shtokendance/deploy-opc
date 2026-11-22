@@ -387,7 +387,13 @@ router.delete('/application-storage/paths/', function (req, res, next) {
                 )
             )
         })
-        .catch(ApiStatusCodes.createCatcher(res))
+        .catch(function (error: unknown) {
+            const message =
+                error instanceof Error && !('code' in error)
+                    ? error.message
+                    : 'Storage path is inaccessible on the Deploy node'
+            res.send(new BaseApi(ApiStatusCodes.STATUS_ERROR_GENERIC, message))
+        })
 })
 
 router.get('/diskusage/', function (req, res, next) {
