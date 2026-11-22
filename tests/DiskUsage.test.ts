@@ -202,6 +202,7 @@ describe('disk usage', () => {
             )
 
             const app = express()
+            app.use(express.json())
             app.use((_req, res, next) => {
                 if (authorized) {
                     res.locals.user = {
@@ -263,6 +264,30 @@ describe('disk usage', () => {
                 )
             }
         )
+
+        test('application storage removal returns a structured refusal for a mismatched node', async () => {
+            const getMounts = jest.spyOn(DockerApi.get(), 'getServiceMounts')
+            const response = await fetch(
+                url.replace(/diskusage$/, 'application-storage/paths/'),
+                {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        root: '/data-vdc',
+                        node_id: 'another-node',
+                        directory: 'app-35bc3c5a-7f8c-4bd0-80ec-58b7ea18c75e',
+                    }),
+                }
+            )
+
+            expect(response.status).toBe(200)
+            expect(await response.json()).toMatchObject({
+                status: ApiStatusCodes.STATUS_ERROR_GENERIC,
+                description:
+                    'Storage node does not match the active Deploy node',
+            })
+            expect(getMounts).not.toHaveBeenCalled()
+        })
 
         test('application storage returns only mounted paths for authenticated requests', async () => {
             const docker = DockerApi.get()
