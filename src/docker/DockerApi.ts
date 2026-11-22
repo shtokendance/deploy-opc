@@ -341,6 +341,82 @@ class DockerApi {
         return service.Spec.TaskTemplate.ContainerSpec?.Mounts || []
     }
 
+    async getApplicationStorageBindSources(root: string): Promise<string[]> {
+        const [services, rawTasks, containers, volumes] = await Promise.all([
+            this.getAllServices(),
+            this.dockerode.listTasks(),
+            this.dockerode.listContainers({ all: true }),
+            this.dockerode.listVolumes(),
+        ])
+        const tasks: {
+            ServiceID: string
+            Spec?: { ContainerSpec?: { Mounts?: Mount[] } }
+            Status: { State: string }
+        }[] = rawTasks
+        const captain = CaptainConstants.captainServiceName
+        const captainID = services.find(
+            (service) => service.Spec.Name === captain
+        )?.ID
+        const bindSources = (mounts: Mount[], manager: boolean) =>
+            mounts
+                .filter(
+                    (mount) =>
+                        mount.Type === 'bind' &&
+                        !(
+                            manager &&
+                            mount.Source === mount.Target &&
+                            (mount.Source === root ||
+                                root.startsWith(mount.Source + '/'))
+                        )
+                )
+                .map((mount) => mount.Source)
+        return [
+            ...services.flatMap((service) =>
+                bindSources(
+                    [
+                        ...(service.Spec.TaskTemplate.ContainerSpec?.Mounts ||
+                            []),
+                        ...(service.PreviousSpec?.TaskTemplate.ContainerSpec
+                            ?.Mounts || []),
+                    ],
+                    service.Spec.Name === captain
+                )
+            ),
+            ...tasks
+                .filter(
+                    (task) =>
+                        ![
+                            'shutdown',
+                            'complete',
+                            'failed',
+                            'rejected',
+                            'remove',
+                            'orphaned',
+                        ].includes(task.Status.State)
+                )
+                .flatMap((task) =>
+                    bindSources(
+                        task.Spec?.ContainerSpec?.Mounts || [],
+                        task.ServiceID === captainID
+                    )
+                ),
+            ...containers.flatMap((container) =>
+                bindSources(
+                    (container.Mounts || []).map((mount) => ({
+                        Type: mount.Type,
+                        Source: mount.Source,
+                        Target: mount.Destination,
+                    })),
+                    container.Labels?.['com.docker.swarm.service.name'] ===
+                        captain
+                )
+            ),
+            ...(volumes.Volumes || []).flatMap(({ Options }) =>
+                Options?.device ? [Options.device] : []
+            ),
+        ]
+    }
+
     async setApplicationReplicas(
         serviceName: string,
         replicas: number,
