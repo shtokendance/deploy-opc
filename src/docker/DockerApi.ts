@@ -51,6 +51,21 @@ import dockerodeUtils = require('dockerode/lib/util')
 const Base64 = Base64Provider.Base64
 const CAPROVER_MANAGED_SERVICE_LABEL = 'com.caprover.managed'
 
+function rejectInterruptedDockerStream(
+    stream: NodeJS.ReadableStream,
+    reject: (reason: Error) => void
+) {
+    let ended = false
+    stream.on('end', () => {
+        ended = true
+    })
+    stream.on('error', reject)
+    stream.on('close', () => {
+        if (!ended)
+            reject(new Error('Docker closed the operation before completion'))
+    })
+}
+
 function isMissingService(error: unknown) {
     return (
         typeof error === 'object' &&
@@ -694,7 +709,8 @@ class DockerApi {
         tarballFilePath: string,
         buildLogs: BuildLog,
         envVars: IAppEnvVar[],
-        registryConfig: DockerRegistryConfig
+        registryConfig: DockerRegistryConfig,
+        signal?: AbortSignal
     ) {
         const self = this
 
@@ -704,6 +720,7 @@ class DockerApi {
 
         return Promise.resolve()
             .then(function () {
+                signal?.throwIfAborted()
                 const buildargs = Object.fromEntries(
                     envVars.map((env) => [env.key, env.value])
                 )
@@ -718,6 +735,7 @@ class DockerApi {
                     t: imageName,
                     buildargs: buildargs,
                     version: CaptainConstants.configs.defaultDockerBuildVersion,
+                    ...(signal ? { abortSignal: signal } : {}),
                 }
 
                 if (Object.keys(registryConfig).length > 0) {
@@ -783,12 +801,11 @@ class DockerApi {
                         resolve()
                     })
 
-                    stream.on('error', function (chunk) {
-                        errorMessage += chunk
-                    })
+                    rejectInterruptedDockerStream(stream, reject)
                 })
             })
             .then(function () {
+                signal?.throwIfAborted()
                 return self.dockerode.getImage(imageName).tag({
                     tag: newVersion,
                     repo: imageName,
@@ -816,7 +833,8 @@ class DockerApi {
 
     pullImage(
         imageNameIncludingTag: string,
-        authObj: DockerAuthObj | undefined
+        authObj: DockerAuthObj | undefined,
+        signal?: AbortSignal
     ) {
         const self = this
 
@@ -828,10 +846,12 @@ class DockerApi {
 
         return Promise.resolve()
             .then(function () {
+                signal?.throwIfAborted()
                 return self.dockerode.createImage({
                     fromImage: repository,
                     tag: tag,
                     authconfig: authObj,
+                    ...(signal ? { abortSignal: signal } : {}),
                 })
             })
             .then(function (stream) {
@@ -882,9 +902,7 @@ class DockerApi {
                         resolve()
                     })
 
-                    stream.on('error', function (chunk) {
-                        errorMessage += chunk
-                    })
+                    rejectInterruptedDockerStream(stream, reject)
                 })
             })
     }
@@ -1116,7 +1134,12 @@ class DockerApi {
         })
     }
 
-    pushImage(imageName: string, authObj: DockerAuthObj, buildLogs: BuildLog) {
+    pushImage(
+        imageName: string,
+        authObj: DockerAuthObj,
+        buildLogs: BuildLog,
+        signal?: AbortSignal
+    ) {
         const self = this
 
         buildLogs.log(`Pushing to remote: ${imageName}`)
@@ -1125,8 +1148,10 @@ class DockerApi {
 
         return Promise.resolve()
             .then(function () {
+                signal?.throwIfAborted()
                 return self.dockerode.getImage(imageName).push({
                     authconfig: authObj,
+                    ...(signal ? { abortSignal: signal } : {}),
                 })
             })
             .then(function (stream) {
@@ -1178,9 +1203,7 @@ class DockerApi {
                         resolve()
                     })
 
-                    stream.on('error', function (chunk) {
-                        errorMessage += chunk
-                    })
+                    rejectInterruptedDockerStream(stream, reject)
                 })
             })
     }

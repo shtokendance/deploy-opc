@@ -96,7 +96,8 @@ export default class ImageMaker {
         appName: string,
         captainDefinitionRelativeFilePath: string,
         appVersion: number,
-        envVars: IAppEnvVar[]
+        envVars: IAppEnvVar[],
+        signal?: AbortSignal
     ): Promise<IBuiltImage> {
         const self = this
 
@@ -119,6 +120,7 @@ export default class ImageMaker {
 
         return Promise.resolve() //
             .then(function () {
+                signal?.throwIfAborted()
                 return self.extractContentIntoDestDirectory(
                     imageSource,
                     rawDir,
@@ -148,6 +150,7 @@ export default class ImageMaker {
                 )
             })
             .then(function (captainDefinitionAbsolutePath) {
+                signal?.throwIfAborted()
                 return self
                     .getCaptainDefinition(captainDefinitionAbsolutePath)
                     .then(function (captainDefinition) {
@@ -182,7 +185,8 @@ export default class ImageMaker {
                                         .then(function (authObj) {
                                             return self.dockerApi.pullImage(
                                                 providedImageName,
-                                                authObj
+                                                authObj,
+                                                ...(signal ? [signal] : [])
                                             )
                                         })
                                         .then(function () {
@@ -198,11 +202,13 @@ export default class ImageMaker {
                             baseImageNameWithoutVerAndReg,
                             appName,
                             appVersion,
-                            envVars
+                            envVars,
+                            signal
                         )
                     })
             })
             .then(function (ret) {
+                signal?.throwIfAborted()
                 fullImageName = ret
             })
             .then(function () {
@@ -260,7 +266,8 @@ export default class ImageMaker {
         baseImageNameWithoutVersionAndReg: string,
         appName: string,
         appVersion: number,
-        envVars: IAppEnvVar[]
+        envVars: IAppEnvVar[],
+        signal?: AbortSignal
     ) {
         const self = this
         return Promise.resolve() //
@@ -280,6 +287,7 @@ export default class ImageMaker {
                         return self.dockerRegistryHelper.createDockerRegistryConfig()
                     })
                     .then(function (registryConfig) {
+                        signal?.throwIfAborted()
                         return self.dockerApi
                             .buildImageFromDockerFile(
                                 baseImageNameWithoutVersionAndReg,
@@ -287,7 +295,8 @@ export default class ImageMaker {
                                 tarFilePath,
                                 self.buildLogsManager.getAppBuildLogs(appName),
                                 envVars,
-                                registryConfig
+                                registryConfig,
+                                signal
                             )
                             .catch(function (error: AnyError) {
                                 throw ApiStatusCodes.createError(
@@ -297,10 +306,12 @@ export default class ImageMaker {
                             })
                     })
                     .then(function () {
+                        signal?.throwIfAborted()
                         return self.dockerRegistryHelper.retagAndPushIfDefaultPushExist(
                             baseImageNameWithoutVersionAndReg,
                             appVersion,
-                            self.buildLogsManager.getAppBuildLogs(appName)
+                            self.buildLogsManager.getAppBuildLogs(appName),
+                            signal
                         )
                     })
             })
