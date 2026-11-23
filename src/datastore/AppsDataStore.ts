@@ -391,6 +391,16 @@ class AppsDataStore {
         })
     }
 
+    async updateRuntimeEnvironment(appName: string, changes: IAppEnvVar[]) {
+        const app = await this.getAppDefinition(appName)
+        const keys = new Set(changes.map(({ key }) => key))
+        app.envVars = [
+            ...(app.envVars || []).filter(({ key }) => !keys.has(key)),
+            ...changes,
+        ]
+        await this.saveApp(appName, app)
+    }
+
     setSslForDefaultSubDomain(appName: string, isEnabled: boolean) {
         const self = this
 

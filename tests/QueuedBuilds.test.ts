@@ -36,6 +36,9 @@ describe('ServiceManager queued builds', () => {
                 envVars: [],
                 captainDefinitionRelativeFilePath: './captain-definition',
             }),
+            getAppDefinitions: jest
+                .fn()
+                .mockResolvedValue({ app: { versions: [] } }),
             setDeployedVersionAndImage: jest.fn().mockResolvedValue(undefined),
             savePreparedBuild: jest.fn().mockResolvedValue(undefined),
         }
@@ -81,6 +84,35 @@ describe('ServiceManager queued builds', () => {
             log: '',
         })
         expect(apps.setDeployedVersionAndImage).not.toHaveBeenCalled()
+        expect(manager.ensureServiceInitedAndUpdated).not.toHaveBeenCalled()
+    })
+
+    test('stopping a candidate addresses its exact receipt and waits for the active build to settle', async () => {
+        const receipt = '55711c0b-06de-4345-9f09-439bfdf4b2f2'
+        const started = deferred<AbortSignal>()
+        const ensureImage = jest.fn((...args: unknown[]) => {
+            const signal = args[5] as AbortSignal
+            started.resolve(signal)
+            return new Promise((_, reject) => {
+                signal.addEventListener('abort', () => reject(signal.reason))
+            })
+        })
+        const manager = serviceManager(ensureImage)
+        const running = manager.scheduleDeployNewVersion('app', {
+            ...source,
+            buildReceipt: receipt,
+        })
+        const settled = expect(running).rejects.toThrow('cancelled')
+        const signal = await started.promise
+        expect(manager.candidateBuildState('app', receipt)).toBe('building')
+        expect(await manager.stopCandidateBuild('app', 'another-receipt')).toBe(
+            false
+        )
+        expect(signal.aborted).toBe(false)
+        expect(await manager.stopCandidateBuild('app', receipt)).toBe(false)
+        await settled
+        expect(await manager.stopCandidateBuild('app', receipt)).toBe(true)
+        expect(manager.isAppBuilding('app')).toBe(false)
         expect(manager.ensureServiceInitedAndUpdated).not.toHaveBeenCalled()
     })
 

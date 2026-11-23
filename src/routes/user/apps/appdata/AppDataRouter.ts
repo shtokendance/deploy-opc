@@ -74,27 +74,55 @@ router.get('/:appName/builds/:receipt', function (req, res) {
                 ApiStatusCodes.STATUS_OK,
                 'Prepared build receipt'
             )
-            reply.data = build
-                ? {
-                      status: build.image
-                          ? 'built'
-                          : build.error
-                            ? 'failed'
-                            : 'building',
-                      image: build.image,
-                      error: build.error,
-                      log:
-                          build.image || build.error
-                              ? build.log
-                              : serviceManager.getCandidateBuildLog(
-                                    appName,
-                                    receipt
-                                ),
-                  }
-                : { status: 'unknown' }
+            const pending = serviceManager.candidateBuildState(appName, receipt)
+            reply.data =
+                build || pending
+                    ? {
+                          status: build?.image
+                              ? 'built'
+                              : build?.error
+                                ? 'failed'
+                                : (pending ?? 'unknown'),
+                          image: build?.image,
+                          error: build?.error,
+                          log:
+                              build?.image || build?.error
+                                  ? build.log
+                                  : serviceManager.getCandidateBuildLog(
+                                        appName,
+                                        receipt
+                                    ),
+                      }
+                    : { status: 'unknown' }
             res.send(reply)
         })
         .catch(ApiStatusCodes.createCatcher(res))
+})
+
+router.delete('/:appName/builds/:receipt', async function (req, res) {
+    const { serviceManager } =
+        InjectionExtractor.extractUserFromInjected(res).user
+    const { appName, receipt } = req.params
+    try {
+        if (!/^[a-f0-9-]{32,36}$/.test(receipt)) {
+            throw ApiStatusCodes.createError(
+                ApiStatusCodes.ILLEGAL_OPERATION,
+                'Invalid candidate build receipt'
+            )
+        }
+        const stopped = await serviceManager.stopCandidateBuild(
+            appName,
+            receipt
+        )
+        const reply = new BaseApi(
+            ApiStatusCodes.STATUS_OK,
+            'Candidate build stop status'
+        )
+        reply.data = { stopped }
+        res.send(reply)
+    } catch (error) {
+        ApiStatusCodes.createCatcher(res)(error)
+    }
 })
 
 router.post<{ appName: string; receipt: string }>(
@@ -116,7 +144,8 @@ router.post<{ appName: string; receipt: string }>(
             if (
                 existing?.image ||
                 existing?.error ||
-                (existing && serviceManager.isAppBuilding(appName))
+                serviceManager.candidateBuildState(appName, receipt) ||
+                serviceManager.isCandidateBuildStopping(appName, receipt)
             ) {
                 res.send(
                     new BaseApi(

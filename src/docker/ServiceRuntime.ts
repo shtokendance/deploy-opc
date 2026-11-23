@@ -1,5 +1,9 @@
 import type Docker = require('dockerode')
-import { AppRuntimeStatus, TaskState } from '../models/AppRuntime'
+import {
+    APPLICATION_ROLLOUT_LABEL,
+    AppRuntimeStatus,
+    TaskState,
+} from '../models/AppRuntime'
 import type { AppRuntimeDetails, RuntimeTask } from '../models/AppRuntime'
 
 // dockerode's task/node list methods return any[]. Describe only the fields
@@ -11,7 +15,9 @@ export interface DockerRuntimeTask {
     NodeID?: string
     CreatedAt: string
     DesiredState: string
-    Spec: { ContainerSpec?: { Image?: string } }
+    Spec: {
+        ContainerSpec?: { Image?: string; Labels?: Record<string, string> }
+    }
     Status: {
         State: string
         Timestamp?: string
@@ -148,7 +154,31 @@ export function getServiceRuntime(
           }
         : null
 
+    const template = service.Spec?.TaskTemplate
+    const rolloutId =
+        template && 'ContainerSpec' in template
+            ? template.ContainerSpec?.Labels?.[APPLICATION_ROLLOUT_LABEL]
+            : undefined
+    const running = current.filter(
+        ({ runtime }) => runtime.state === TaskState.Running
+    )
+    const rolloutTasks = running.filter(
+        ({ task, runtime }) =>
+            runtime.desiredState === TaskState.Running &&
+            task.Spec.ContainerSpec?.Labels?.[APPLICATION_ROLLOUT_LABEL] ===
+                rolloutId
+    )
+
     return {
+        ...(rolloutId
+            ? {
+                  rolloutId,
+                  rolloutRunning: new Set(
+                      rolloutTasks.map(({ task }) => instanceKey(task))
+                  ).size,
+                  previousRunning: running.length - rolloutTasks.length,
+              }
+            : {}),
         status:
             desiredInstances === 0
                 ? AppRuntimeStatus.Stopped

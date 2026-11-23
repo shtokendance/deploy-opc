@@ -55,7 +55,12 @@ export interface AppRuntime {
     error: string | null
 }
 
+export const APPLICATION_ROLLOUT_LABEL = 'com.caprover.application-rollout'
+
 export interface AppRuntimeDetails extends AppRuntime {
+    rolloutId?: string
+    rolloutRunning?: number
+    previousRunning?: number
     /** Most recent historical tasks first; at most ten per app. */
     taskHistory: RuntimeTask[]
 }

@@ -25,7 +25,8 @@ class DockerRegistryHelper {
     retagAndPushIfDefaultPushExist(
         imageName: string,
         version: number,
-        buildLogs: BuildLog
+        buildLogs: BuildLog,
+        signal?: AbortSignal
     ): Promise<string> {
         const self = this
         let allRegistries: IRegistryInfo[]
@@ -75,6 +76,7 @@ class DockerRegistryHelper {
 
                         return Promise.resolve()
                             .then(function () {
+                                signal?.throwIfAborted()
                                 return self.dockerApi.retag(
                                     imageNameWithoutDockerAuth,
                                     fullImageName
@@ -84,7 +86,8 @@ class DockerRegistryHelper {
                                 return self.dockerApi.pushImage(
                                     fullImageName,
                                     authObj,
-                                    buildLogs
+                                    buildLogs,
+                                    signal
                                 )
                             })
                             .catch(function (error: AnyError) {

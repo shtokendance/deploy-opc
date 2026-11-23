@@ -75,6 +75,12 @@ class ServiceManager {
 
     private activeOrScheduledBuilds: IHashMapGeneric<boolean>
     private readonly activeCandidateBuilds = new Map<string, string>()
+    private readonly candidateBuildControllers = new Map<
+        string,
+        AbortController
+    >()
+    private readonly candidateStops = new Set<string>()
+    private readonly stoppedBuildUploads = new Map<string, string>()
     private pendingPreStagedDefinitions: IHashMapGeneric<IAppDef>
     private buildLogsManager: BuildLogsManager
     private queuedBuilds: QueuedBuild[]
@@ -202,6 +208,11 @@ class ServiceManager {
         if (source.buildReceipt) {
             self.activeCandidateBuilds.set(appName, source.buildReceipt)
         }
+        const cancellation = source.buildReceipt
+            ? new AbortController()
+            : undefined
+        if (cancellation)
+            self.candidateBuildControllers.set(appName, cancellation)
 
         function advanceBuildQueueOnce() {
             if (hasAdvancedBuildQueue) {
@@ -233,11 +244,13 @@ class ServiceManager {
                             appName,
                             app.captainDefinitionRelativeFilePath,
                             appVersion,
-                            envVars
+                            envVars,
+                            cancellation?.signal
                         )
                     })
             })
             .then(function (builtImage) {
+                cancellation?.signal.throwIfAborted()
                 if (source.buildReceipt) {
                     return dataStore
                         .getAppsDataStore()
@@ -281,7 +294,9 @@ class ServiceManager {
                             : dataStore
                                   .getAppsDataStore()
                                   .savePreparedBuild(appName, deployedVersion, {
-                                      error: 'Candidate image build failed',
+                                      error: cancellation?.signal.aborted
+                                          ? 'Candidate image build cancelled'
+                                          : 'Candidate image build failed',
                                       log: self.buildLogTail(appName),
                                   })
                     return record
@@ -313,6 +328,7 @@ class ServiceManager {
     onBuildFinished(appName: string) {
         const self = this
         self.activeCandidateBuilds.delete(appName)
+        self.candidateBuildControllers.delete(appName)
         self.activeOrScheduledBuilds[appName] = false
 
         Promise.resolve().then(function () {
@@ -987,6 +1003,93 @@ class ServiceManager {
         return this.buildLogTail(appName)
     }
 
+    candidateBuildState(appName: string, receipt: string) {
+        if (this.activeCandidateBuilds.get(appName) === receipt)
+            return 'building'
+        if (
+            this.queuedBuilds.some(
+                (build) =>
+                    build.appName === appName &&
+                    build.source.buildReceipt === receipt
+            )
+        )
+            return 'queued'
+        return undefined
+    }
+
+    isCandidateBuildStopping(appName: string, receipt: string) {
+        const key = appName + ':' + receipt
+        return (
+            this.candidateStops.has(key) ||
+            this.stoppedBuildUploads.has(key) ||
+            (this.activeCandidateBuilds.get(appName) === receipt &&
+                this.candidateBuildControllers.get(appName)?.signal.aborted ===
+                    true)
+        )
+    }
+
+    async stopCandidateBuild(
+        appName: string,
+        receipt: string
+    ): Promise<boolean> {
+        const reason = new Error('Candidate image build cancelled')
+        if (this.activeCandidateBuilds.get(appName) === receipt) {
+            this.candidateBuildControllers.get(appName)?.abort(reason)
+            return false
+        }
+        if (
+            this.isAppBuilding(appName) &&
+            this.candidateBuildState(appName, receipt) !== 'queued'
+        ) {
+            return false
+        }
+        const key = appName + ':' + receipt
+        if (this.candidateStops.has(key)) return false
+        this.candidateStops.add(key)
+        try {
+            const queued = this.queuedBuilds.findIndex(
+                (build) =>
+                    build.appName === appName &&
+                    build.source.buildReceipt === receipt
+            )
+            if (queued >= 0) {
+                const [build] = this.queuedBuilds.splice(queued, 1)
+                this.activeOrScheduledBuilds[appName] = false
+                const upload =
+                    build.source.uploadedTarPathSource?.uploadedTarPath
+                if (upload) this.stoppedBuildUploads.set(key, upload)
+                build.promiseToSave.reject?.(reason)
+            }
+            const upload = this.stoppedBuildUploads.get(key)
+            if (upload) {
+                await fs.remove(upload)
+                this.stoppedBuildUploads.delete(key)
+            }
+            const apps = this.dataStore.getAppsDataStore()
+            const app = (await apps.getAppDefinitions())[appName]
+            if (app) {
+                const version = app.versions.find(
+                    (item) => item.preparedBuild?.receipt === receipt
+                )
+                if (
+                    !version?.preparedBuild?.image &&
+                    !version?.preparedBuild?.error
+                ) {
+                    const id =
+                        version?.version ??
+                        (await apps.createNewVersion(appName, receipt))
+                    await apps.savePreparedBuild(appName, id, {
+                        error: reason.message,
+                        log: version?.preparedBuild?.log ?? '',
+                    })
+                }
+            }
+            return true
+        } finally {
+            this.candidateStops.delete(key)
+        }
+    }
+
     private buildLogTail(appName: string) {
         const lines: string[] = this.getBuildStatus(appName).logs.lines
         return lines.join('\n').trim().slice(-12_000)
@@ -1027,6 +1130,24 @@ class ServiceManager {
                     }),
                 }
             })
+    }
+
+    async restartApplication(
+        appName: string,
+        operationId: string,
+        changes: IAppEnvVar[]
+    ) {
+        this.ensureNotBuilding(appName)
+        const apps = this.dataStore.getAppsDataStore()
+        const app = await apps.getAppDefinition(appName)
+        this.ensureNotBuilding(appName)
+        await this.dockerApi.restartApplication(
+            apps.getServiceName(appName, !!app.isLegacyAppName),
+            operationId,
+            changes
+        )
+        if (changes.length)
+            await apps.updateRuntimeEnvironment(appName, changes)
     }
 
     getAppRuntime(appName: string): Promise<AppRuntimeDetails> {
