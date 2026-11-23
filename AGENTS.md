@@ -97,3 +97,17 @@ Run the narrowest relevant Jest test while iterating, then the full suite before
 The repository formatter and lint scripts currently cover `src/**/*.ts`. Explicitly run Prettier
 and ESLint on changed TypeScript files outside `src`, especially new tests. Run `git diff --check`
 and inspect `git status --short` before handoff.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked as local markdown files under `.scratch/<feature-slug>/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical triage labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout (`GLOSSARY.md` and `docs/adr/` at the repo root, created lazily when needed). See `docs/agents/domain.md`.
