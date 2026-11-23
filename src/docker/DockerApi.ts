@@ -1,3 +1,4 @@
+import { APPLICATION_ROLLOUT_LABEL } from '../models/AppRuntime'
 import Base64Provider = require('js-base64')
 import Docker = require('dockerode')
 import { v4 as uuid } from 'uuid'
@@ -430,6 +431,48 @@ class DockerApi {
                 Options?.device ? [Options.device] : []
             ),
         ]
+    }
+
+    async restartApplication(
+        serviceName: string,
+        operationId: string,
+        changes: IAppEnvVar[]
+    ) {
+        const service = this.dockerode.getService(serviceName)
+        const current = await service.inspect()
+        const task = current.Spec.TaskTemplate
+        const container = task?.ContainerSpec
+        if (
+            current.Spec.Name !== serviceName ||
+            current.Spec.Labels?.[CAPROVER_MANAGED_SERVICE_LABEL] !== 'true' ||
+            !current.Spec.Mode?.Replicated?.Replicas ||
+            !container
+        ) {
+            throw new Error('The application has no managed service to restart')
+        }
+        if (container.Labels?.[APPLICATION_ROLLOUT_LABEL] === operationId)
+            return
+
+        const keys = new Set(changes.map(({ key }) => key))
+        const env = ((container.Env || []) as string[]).filter(
+            (value) => !keys.has(value.split('=', 1)[0])
+        )
+        env.push(...changes.map(({ key, value }) => `${key}=${value}`))
+        await service.update({
+            ...current.Spec,
+            version: current.Version.Index,
+            TaskTemplate: {
+                ...task,
+                ContainerSpec: {
+                    ...container,
+                    ...(changes.length ? { Env: env } : {}),
+                    Labels: {
+                        ...container.Labels,
+                        [APPLICATION_ROLLOUT_LABEL]: operationId,
+                    },
+                },
+            },
+        })
     }
 
     async setApplicationReplicas(
@@ -2025,6 +2068,9 @@ class DockerApi {
                 // to restart once. Once rebooted, all changes start showing up.
                 updatedData.TaskTemplate.ContainerSpec.Labels =
                     updatedData.TaskTemplate.ContainerSpec.Labels || {}
+                delete updatedData.TaskTemplate.ContainerSpec.Labels[
+                    APPLICATION_ROLLOUT_LABEL
+                ]
                 updatedData.TaskTemplate.ContainerSpec.Labels.randomLabelForceUpdate =
                     uuid()
 

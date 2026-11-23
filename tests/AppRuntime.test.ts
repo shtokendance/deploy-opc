@@ -569,3 +569,37 @@ describe('authenticated runtime routes through the real Docker client', () => {
         }
     )
 })
+
+test('runtime rollout distinguishes the previous and replacement tasks', () => {
+    const current = service()
+    current.Spec = {
+        ...current.Spec,
+        TaskTemplate: {
+            ContainerSpec: {
+                Labels: { 'com.caprover.application-rollout': 'update-a' },
+            },
+        },
+    }
+    const old = task({
+        ID: 'old-instance',
+        DesiredState: TaskState.Shutdown,
+    })
+    const replacement = task({
+        ID: 'new-instance',
+        Spec: {
+            ContainerSpec: {
+                Image: 'website:v8',
+                Labels: { 'com.caprover.application-rollout': 'update-a' },
+            },
+        },
+    })
+    expect(getServiceRuntime(current, [old, replacement], [])).toMatchObject({
+        rolloutId: 'update-a',
+        rolloutRunning: 1,
+        previousRunning: 1,
+    })
+    expect(getServiceRuntime(current, [replacement], [])).toMatchObject({
+        rolloutRunning: 1,
+        previousRunning: 0,
+    })
+})

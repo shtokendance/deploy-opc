@@ -1132,6 +1132,24 @@ class ServiceManager {
             })
     }
 
+    async restartApplication(
+        appName: string,
+        operationId: string,
+        changes: IAppEnvVar[]
+    ) {
+        this.ensureNotBuilding(appName)
+        const apps = this.dataStore.getAppsDataStore()
+        const app = await apps.getAppDefinition(appName)
+        this.ensureNotBuilding(appName)
+        await this.dockerApi.restartApplication(
+            apps.getServiceName(appName, !!app.isLegacyAppName),
+            operationId,
+            changes
+        )
+        if (changes.length)
+            await apps.updateRuntimeEnvironment(appName, changes)
+    }
+
     getAppRuntime(appName: string): Promise<AppRuntimeDetails> {
         const appsDataStore = this.dataStore.getAppsDataStore()
         const dockerApi = this.dockerApi

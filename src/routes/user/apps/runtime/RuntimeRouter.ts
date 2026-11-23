@@ -47,6 +47,49 @@ router.get('/:appName', function (req, res, next) {
         .catch(ApiStatusCodes.createCatcher(res))
 })
 
+router.post<{ appName: string }>(
+    '/:appName/restart',
+    async function (req, res) {
+        const { serviceManager } =
+            InjectionExtractor.extractUserFromInjected(res).user
+        try {
+            const { operationId, changes = [] } = req.body || {}
+            if (
+                typeof operationId !== 'string' ||
+                !/^[a-f0-9-]{36}$/.test(operationId) ||
+                !Array.isArray(changes) ||
+                changes.length > 256 ||
+                changes.some(
+                    (item) =>
+                        !item ||
+                        typeof item.key !== 'string' ||
+                        !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(item.key) ||
+                        typeof item.value !== 'string' ||
+                        item.value.includes('\0')
+                )
+            ) {
+                throw ApiStatusCodes.createError(
+                    ApiStatusCodes.ILLEGAL_PARAMETER,
+                    'Invalid application restart request'
+                )
+            }
+            await serviceManager.restartApplication(
+                req.params.appName,
+                operationId,
+                changes
+            )
+            res.send(
+                new BaseApi(
+                    ApiStatusCodes.STATUS_OK,
+                    'Application restart submitted'
+                )
+            )
+        } catch (error) {
+            ApiStatusCodes.createCatcher(res)(error)
+        }
+    }
+)
+
 router.get('/:appName/write-hold', function (req, res) {
     const { serviceManager } =
         InjectionExtractor.extractUserFromInjected(res).user
