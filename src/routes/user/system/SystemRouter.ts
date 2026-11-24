@@ -10,9 +10,11 @@ import InjectionExtractor from '../../../injection/InjectionExtractor'
 import { IAppDef } from '../../../models/AppDefinition'
 import { AutomatedCleanupConfigsCleaner } from '../../../models/AutomatedCleanupConfigs'
 import {
+    inspectApplicationVolumePaths,
     listApplicationVolumeRoots,
     prepareApplicationVolumePath,
     removeLocalApplicationVolumeDirectory,
+    streamApplicationVolumesTarGz,
 } from '../../../user/system/ApplicationVolumePaths'
 import CaptainManager from '../../../user/system/CaptainManager'
 import VersionManager from '../../../user/system/VersionManager'
@@ -836,6 +838,103 @@ router.post('/nodes/', function (req, res, next) {
             res.send(new BaseApi(ApiStatusCodes.STATUS_OK, msg))
         })
         .catch(ApiStatusCodes.createCatcher(res))
+})
+
+router.post('/application-storage/inspect/', function (req, res) {
+    const { node_id, paths } = req.body || {}
+    if (
+        typeof node_id !== 'string' ||
+        !Array.isArray(paths) ||
+        paths.some((p) => typeof p !== 'string')
+    ) {
+        res.send(
+            new BaseApi(
+                ApiStatusCodes.STATUS_ERROR_GENERIC,
+                'Invalid storage inspect request'
+            )
+        )
+        return
+    }
+    Promise.resolve()
+        .then(async function () {
+            if (node_id !== CaptainManager.get().getMyNodeId()) {
+                throw new Error(
+                    'Storage node does not match the active Deploy node'
+                )
+            }
+            const serviceMounts = await DockerApi.get().getServiceMounts(
+                CaptainConstants.captainServiceName
+            )
+            const stats = await inspectApplicationVolumePaths(
+                paths,
+                serviceMounts
+            )
+            const response = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'Application volume paths inspected'
+            )
+            response.data = { paths: stats }
+            res.send(response)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
+router.post('/application-storage/export/', function (req, res) {
+    const { node_id, app_slug, app_name, mounts, max_bytes } = req.body || {}
+    if (
+        typeof node_id !== 'string' ||
+        typeof app_slug !== 'string' ||
+        !app_slug.trim() ||
+        !Array.isArray(mounts) ||
+        mounts.length === 0
+    ) {
+        res.status(400).send(
+            new BaseApi(
+                ApiStatusCodes.STATUS_ERROR_GENERIC,
+                'Invalid storage export request'
+            )
+        )
+        return
+    }
+    Promise.resolve()
+        .then(async function () {
+            if (node_id !== CaptainManager.get().getMyNodeId()) {
+                throw new Error(
+                    'Storage node does not match the active Deploy node'
+                )
+            }
+            const serviceMounts = await DockerApi.get().getServiceMounts(
+                CaptainConstants.captainServiceName
+            )
+            res.setHeader('Content-Type', 'application/gzip')
+            res.setHeader(
+                'Content-Disposition',
+                `attachment; filename="${app_slug.trim()}-volumes.tar.gz"`
+            )
+            await streamApplicationVolumesTarGz(
+                {
+                    app_slug: app_slug.trim(),
+                    app_name:
+                        typeof app_name === 'string'
+                            ? app_name.trim()
+                            : undefined,
+                    mounts,
+                    max_bytes:
+                        typeof max_bytes === 'number' ? max_bytes : undefined,
+                },
+                serviceMounts,
+                res
+            )
+        })
+        .catch(function (err: Error) {
+            if (!res.headersSent) {
+                res.status(400).send(
+                    new BaseApi(ApiStatusCodes.STATUS_ERROR_GENERIC, err.message)
+                )
+            } else {
+                res.destroy(err)
+            }
+        })
 })
 
 export default router
