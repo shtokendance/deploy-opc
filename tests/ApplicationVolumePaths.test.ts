@@ -1,10 +1,14 @@
 import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
+import { PassThrough } from 'stream'
+import * as tar from 'tar'
 import type { Mount } from '../src/models/DockerService'
 import {
+    inspectApplicationVolumePaths,
     listApplicationVolumeRoots,
     removeLocalApplicationVolumeDirectory,
+    streamApplicationVolumesTarGz,
 } from '../src/user/system/ApplicationVolumePaths'
 
 describe('ApplicationVolumePaths.listApplicationVolumeRoots', () => {
@@ -154,4 +158,152 @@ it('removes only an unreferenced application directory on its verified storage r
     } finally {
         await fs.rm(root, { recursive: true, force: true })
     }
+})
+
+describe('ApplicationVolumePaths.inspectAndExport', () => {
+    it('inspects host volume directories and rejects paths outside configured roots', async () => {
+        const base = await fs.realpath(
+            await fs.mkdtemp(path.join(os.tmpdir(), 'opc-inspect-vol-'))
+        )
+        const root = path.join(base, 'data-vdc')
+        const appDir = path.join(root, 'my-app-12345678-1234-1234-1234-1234567890ab')
+        const dataDir = path.join(appDir, 'data')
+        const outsideDir = path.join(base, 'outside')
+        await fs.mkdir(path.join(dataDir, 'sub'), { recursive: true })
+        await fs.mkdir(outsideDir, { recursive: true })
+        await fs.writeFile(path.join(dataDir, 'state.json'), '{"ok":true}')
+        await fs.writeFile(path.join(dataDir, 'sub', 'item.txt'), 'hello')
+        await fs.writeFile(path.join(outsideDir, 'secret.txt'), 'nope')
+
+        const serviceMounts: Mount[] = [
+            { Type: 'bind', Source: root, Target: root, ReadOnly: false },
+        ]
+        const mountInfoText = `100 1 8:1 / ${root} rw,relatime - ext4 /dev/vda1 rw`
+        const options = { configuredRoots: root, mountInfoText }
+
+        try {
+            const missingDir = path.join(appDir, 'uploads')
+            const stats = await inspectApplicationVolumePaths(
+                [dataDir, missingDir],
+                serviceMounts,
+                options
+            )
+            expect(stats).toEqual([
+                {
+                    host_path: dataDir,
+                    exists: true,
+                    file_count: 2,
+                    size_bytes: 16,
+                    sample_files: ['state.json', 'sub/item.txt'],
+                },
+                {
+                    host_path: missingDir,
+                    exists: false,
+                    file_count: 0,
+                    size_bytes: 0,
+                    sample_files: [],
+                },
+            ])
+
+            await expect(
+                inspectApplicationVolumePaths(
+                    [outsideDir],
+                    serviceMounts,
+                    options
+                )
+            ).rejects.toThrow('outside the configured Deploy mounts')
+        } finally {
+            await fs.rm(base, { recursive: true, force: true })
+        }
+    })
+
+    it('streams tar.gz archive preserving container paths and manifest.json, and enforces maxBytes', async () => {
+        const base = await fs.realpath(
+            await fs.mkdtemp(path.join(os.tmpdir(), 'opc-export-vol-'))
+        )
+        const root = path.join(base, 'data-vdc')
+        const appDir = path.join(root, 'audit-12345678-1234-1234-1234-1234567890ab')
+        const dataDir = path.join(appDir, 'data')
+        const uploadsDir = path.join(appDir, 'uploads')
+        const extractDir = path.join(base, 'extracted')
+        await fs.mkdir(dataDir, { recursive: true })
+        await fs.mkdir(path.join(uploadsDir, '2026'), { recursive: true })
+        await fs.mkdir(extractDir, { recursive: true })
+        await fs.writeFile(path.join(dataDir, 'db.json'), '{"v":1}')
+        await fs.writeFile(path.join(uploadsDir, '2026', 'a.txt'), 'abcde')
+
+        const serviceMounts: Mount[] = [
+            { Type: 'bind', Source: root, Target: root, ReadOnly: false },
+        ]
+        const mountInfoText = `100 1 8:1 / ${root} rw,relatime - ext4 /dev/vda1 rw`
+        const options = { configuredRoots: root, mountInfoText }
+
+        try {
+            await expect(
+                streamApplicationVolumesTarGz(
+                    {
+                        app_slug: 'audit',
+                        mounts: [],
+                    },
+                    serviceMounts,
+                    new PassThrough(),
+                    options
+                )
+            ).rejects.toThrow('No mounts')
+
+            await expect(
+                streamApplicationVolumesTarGz(
+                    {
+                        app_slug: 'audit',
+                        mounts: [
+                            { container_path: '/app/data', host_path: dataDir },
+                            { container_path: '/app/uploads', host_path: uploadsDir },
+                        ],
+                        max_bytes: 8,
+                    },
+                    serviceMounts,
+                    new PassThrough(),
+                    options
+                )
+            ).rejects.toThrow('exceeds export limit')
+
+            const archivePath = path.join(base, 'out.tar.gz')
+            const fileHandle = await fs.open(archivePath, 'w')
+            const writeStream = fileHandle.createWriteStream()
+            await streamApplicationVolumesTarGz(
+                {
+                    app_slug: 'audit',
+                    app_name: 'Audit App',
+                    mounts: [
+                        { container_path: '/app/data', host_path: dataDir },
+                        { container_path: '/app/uploads', host_path: uploadsDir },
+                    ],
+                },
+                serviceMounts,
+                writeStream,
+                options
+            )
+
+            await tar.extract({ file: archivePath, cwd: extractDir })
+            const manifest = JSON.parse(
+                await fs.readFile(path.join(extractDir, 'manifest.json'), 'utf8')
+            )
+            expect(manifest.app_slug).toBe('audit')
+            expect(manifest.mounts).toHaveLength(2)
+            expect(
+                await fs.readFile(
+                    path.join(extractDir, 'volumes/app/data/db.json'),
+                    'utf8'
+                )
+            ).toBe('{"v":1}')
+            expect(
+                await fs.readFile(
+                    path.join(extractDir, 'volumes/app/uploads/2026/a.txt'),
+                    'utf8'
+                )
+            ).toBe('abcde')
+        } finally {
+            await fs.rm(base, { recursive: true, force: true })
+        }
+    })
 })

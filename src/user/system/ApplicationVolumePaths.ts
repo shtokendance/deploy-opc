@@ -1,5 +1,9 @@
+import { createReadStream } from 'fs'
 import fs from 'fs/promises'
 import path from 'path'
+import type { Writable } from 'stream'
+import { createGzip } from 'zlib'
+import { Header, Pax } from 'tar'
 import type { Mount } from '../../models/DockerService'
 
 export type ApplicationVolumeBackend = 'local-directory' | 'aliyun-oss-volume'
@@ -340,4 +344,339 @@ export async function removeLocalApplicationVolumeDirectory(
         }
     }
     await fs.rm(target, { recursive: true, force: true })
+}
+
+export interface ApplicationVolumePathStat {
+    host_path: string
+    exists: boolean
+    file_count: number
+    size_bytes: number
+    sample_files: string[]
+}
+
+export interface ApplicationVolumeExportMount {
+    container_path: string
+    host_path: string
+    name?: string
+}
+
+export interface ApplicationVolumeExportRequest {
+    app_slug: string
+    app_name?: string
+    mounts: ApplicationVolumeExportMount[]
+    max_bytes?: number
+}
+
+const DEFAULT_EXPORT_MAX_BYTES = 2 * 1024 * 1024 * 1024
+
+async function resolveVerifiedHostPath(
+    hostPath: string,
+    serviceMounts: Mount[],
+    mountEntries: MountInfoEntry[],
+    configuredRoots: string[]
+): Promise<{ root: string; exists: boolean }> {
+    if (!canonicalPath(hostPath)) {
+        throw new Error('Storage root is outside the configured Deploy mounts')
+    }
+    const allowed = configuredRoots.find(
+        (entry) =>
+            canonicalPath(entry) &&
+            serviceMounts.some(
+                (mount) =>
+                    mount.Type === 'bind' &&
+                    mount.Source === entry &&
+                    mount.Target === entry &&
+                    !mount.ReadOnly
+            ) &&
+            hostPath.startsWith(entry + '/')
+    )
+    if (!allowed) {
+        throw new Error('Storage root is outside the configured Deploy mounts')
+    }
+    await resolveVerifiedRoot(allowed, serviceMounts, mountEntries, configuredRoots)
+    const stat = await fs
+        .lstat(hostPath)
+        .catch((error: NodeJS.ErrnoException) => {
+            if (error.code === 'ENOENT') return undefined
+            throw error
+        })
+    if (!stat) {
+        return { root: allowed, exists: false }
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new Error('Target is not a local application directory')
+    }
+    const real = await fs.realpath(hostPath)
+    if (real !== hostPath) {
+        throw new Error('Storage root is outside the configured Deploy mounts')
+    }
+    return { root: allowed, exists: true }
+}
+
+interface WalkedFile {
+    absPath: string
+    relPath: string
+    size: number
+    mode: number
+    mtime: Date
+}
+
+async function walkDirectoryFiles(rootDir: string): Promise<WalkedFile[]> {
+    const files: WalkedFile[] = []
+    const queue: string[] = ['']
+    while (queue.length > 0) {
+        const relDir = queue.shift() || ''
+        const absDir = relDir ? path.posix.join(rootDir, relDir) : rootDir
+        const entries = await fs.readdir(absDir, { withFileTypes: true })
+        entries.sort((a, b) => a.name.localeCompare(b.name))
+        for (const entry of entries) {
+            if (entry.isSymbolicLink()) continue
+            const relItem = relDir
+                ? path.posix.join(relDir, entry.name)
+                : entry.name
+            const absItem = path.posix.join(rootDir, relItem)
+            if (entry.isDirectory()) {
+                queue.push(relItem)
+            } else if (entry.isFile()) {
+                const stat = await fs.lstat(absItem)
+                if (!stat.isFile()) continue
+                files.push({
+                    absPath: absItem,
+                    relPath: relItem,
+                    size: stat.size,
+                    mode: stat.mode & 0o777,
+                    mtime: stat.mtime,
+                })
+            }
+        }
+    }
+    return files
+}
+
+export async function inspectApplicationVolumePaths(
+    hostPaths: string[],
+    serviceMounts: Mount[],
+    options?: { configuredRoots?: string; mountInfoText?: string }
+): Promise<ApplicationVolumePathStat[]> {
+    const configuredRoots = parseConfiguredRoots(options?.configuredRoots)
+    const mountEntries = parseMountInfo(
+        options?.mountInfoText ??
+            (await fs.readFile('/proc/self/mountinfo', 'utf8'))
+    )
+    const results: ApplicationVolumePathStat[] = []
+    for (const hostPath of hostPaths) {
+        const trimmed = String(hostPath || '').trim()
+        const { exists } = await resolveVerifiedHostPath(
+            trimmed,
+            serviceMounts,
+            mountEntries,
+            configuredRoots
+        )
+        if (!exists) {
+            results.push({
+                host_path: trimmed,
+                exists: false,
+                file_count: 0,
+                size_bytes: 0,
+                sample_files: [],
+            })
+            continue
+        }
+        const files = await walkDirectoryFiles(trimmed)
+        let sizeBytes = 0
+        for (const f of files) sizeBytes += f.size
+        results.push({
+            host_path: trimmed,
+            exists: true,
+            file_count: files.length,
+            size_bytes: sizeBytes,
+            sample_files: files.slice(0, 8).map((f) => f.relPath),
+        })
+    }
+    return results
+}
+
+function writeChunk(stream: Writable, chunk: Buffer): Promise<void> {
+    return new Promise((resolve, reject) => {
+        if (stream.write(chunk)) {
+            resolve()
+            return
+        }
+        const onDrain = () => {
+            cleanup()
+            resolve()
+        }
+        const onError = (err: Error) => {
+            cleanup()
+            reject(err)
+        }
+        const cleanup = () => {
+            stream.off('drain', onDrain)
+            stream.off('error', onError)
+        }
+        stream.once('drain', onDrain)
+        stream.once('error', onError)
+    })
+}
+
+async function writeTarHeader(
+    stream: Writable,
+    entryPath: string,
+    size: number,
+    mode: number,
+    mtime: Date
+): Promise<void> {
+    const header = new Header({
+        path: entryPath,
+        size,
+        type: 'File',
+        mode: mode || 0o644,
+        mtime,
+    })
+    const needPax = header.encode()
+    if (needPax) {
+        const paxBuf = new Pax({ path: entryPath, size }).encode()
+        await writeChunk(stream, paxBuf)
+    }
+    if (header.block) {
+        await writeChunk(stream, header.block)
+    }
+}
+
+async function writeTarPadding(stream: Writable, size: number): Promise<void> {
+    const rem = size % 512
+    if (rem > 0) {
+        await writeChunk(stream, Buffer.alloc(512 - rem))
+    }
+}
+
+async function pipeFileToTar(stream: Writable, filePath: string): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+        const rs = createReadStream(filePath)
+        rs.on('data', (chunk: string | Buffer) => {
+            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+            if (!stream.write(buf)) {
+                rs.pause()
+                stream.once('drain', () => rs.resume())
+            }
+        })
+        rs.once('end', () => resolve())
+        rs.once('error', (err) => reject(err))
+    })
+}
+
+export async function streamApplicationVolumesTarGz(
+    req: ApplicationVolumeExportRequest,
+    serviceMounts: Mount[],
+    outputStream: Writable,
+    options?: { configuredRoots?: string; mountInfoText?: string }
+): Promise<void> {
+    if (!req.mounts || req.mounts.length === 0) {
+        throw new Error('No mounts specified for export')
+    }
+    const configuredRoots = parseConfiguredRoots(options?.configuredRoots)
+    const mountEntries = parseMountInfo(
+        options?.mountInfoText ??
+            (await fs.readFile('/proc/self/mountinfo', 'utf8'))
+    )
+    const maxBytes =
+        req.max_bytes && req.max_bytes > 0
+            ? req.max_bytes
+            : DEFAULT_EXPORT_MAX_BYTES
+
+    const prepared: Array<{
+        containerPath: string
+        archivePrefix: string
+        files: WalkedFile[]
+        sizeBytes: number
+    }> = []
+    let totalBytes = 0
+
+    for (const m of req.mounts) {
+        const containerPath = path.posix.normalize(
+            String(m.container_path || '').trim()
+        )
+        const hostPath = String(m.host_path || '').trim()
+        if (!containerPath.startsWith('/') || containerPath === '/') {
+            throw new Error(`Invalid container_path: ${m.container_path}`)
+        }
+        const { exists } = await resolveVerifiedHostPath(
+            hostPath,
+            serviceMounts,
+            mountEntries,
+            configuredRoots
+        )
+        const files = exists ? await walkDirectoryFiles(hostPath) : []
+        let mountBytes = 0
+        for (const f of files) mountBytes += f.size
+        totalBytes += mountBytes
+        if (totalBytes > maxBytes) {
+            throw new Error('Volume data exceeds export limit')
+        }
+        const cleanRel = containerPath.replace(/^\/+/, '')
+        prepared.push({
+            containerPath,
+            archivePrefix: `volumes/${cleanRel}`,
+            files,
+            sizeBytes: mountBytes,
+        })
+    }
+
+    const manifest = {
+        app_slug: req.app_slug,
+        app_name: req.app_name || req.app_slug,
+        exported_at: new Date().toISOString(),
+        total_bytes: totalBytes,
+        mounts: prepared.map((p) => ({
+            container_path: p.containerPath,
+            archive_path: `${p.archivePrefix}/`,
+            file_count: p.files.length,
+            size_bytes: p.sizeBytes,
+        })),
+    }
+    const manifestBuf = Buffer.from(JSON.stringify(manifest, null, 2), 'utf8')
+
+    const gzip = createGzip()
+    const done = new Promise<void>((resolve, reject) => {
+        outputStream.once('finish', resolve)
+        outputStream.once('error', reject)
+        gzip.once('error', reject)
+    })
+    gzip.pipe(outputStream)
+
+    try {
+        await writeTarHeader(
+            gzip,
+            'manifest.json',
+            manifestBuf.length,
+            0o644,
+            new Date()
+        )
+        await writeChunk(gzip, manifestBuf)
+        await writeTarPadding(gzip, manifestBuf.length)
+
+        for (const p of prepared) {
+            for (const f of p.files) {
+                const archivePath = path.posix.join(p.archivePrefix, f.relPath)
+                await writeTarHeader(
+                    gzip,
+                    archivePath,
+                    f.size,
+                    f.mode,
+                    f.mtime
+                )
+                if (f.size > 0) {
+                    await pipeFileToTar(gzip, f.absPath)
+                    await writeTarPadding(gzip, f.size)
+                }
+            }
+        }
+
+        await writeChunk(gzip, Buffer.alloc(1024))
+        gzip.end()
+        await done
+    } catch (err) {
+        gzip.destroy()
+        throw err
+    }
 }
