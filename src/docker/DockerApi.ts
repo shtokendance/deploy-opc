@@ -574,6 +574,287 @@ class DockerApi {
         )
     }
 
+    async getServiceResourceMetrics(serviceName: string) {
+        let service: Docker.Service & {
+            Spec?: {
+                Mode?: { Replicated?: { Replicas?: number } }
+                TaskTemplate?: {
+                    Resources?: {
+                        Limits?: { NanoCPUs?: number; MemoryBytes?: number }
+                    }
+                }
+            }
+        }
+        try {
+            service = await this.dockerode.getService(serviceName).inspect()
+        } catch (err) {
+            if ((err as { statusCode?: number }).statusCode === 404) {
+                return {
+                    available: false,
+                    message: 'Service not found',
+                    replicas_running: 0,
+                    replicas_desired: 0,
+                    cpu_percent: 0,
+                    online_cpus: 0,
+                    cpu_limit_cores: 0,
+                    memory_usage_bytes: 0,
+                    memory_limit_bytes: 0,
+                    host_memory_bytes: 0,
+                    memory_percent: 0,
+                    container_rw_bytes: 0,
+                    container_rootfs_bytes: 0,
+                    network_rx_bytes: 0,
+                    network_tx_bytes: 0,
+                    block_read_bytes: 0,
+                    block_write_bytes: 0,
+                    pids: 0,
+                    restart_count: 0,
+                    started_at: '',
+                    node_hostname: '',
+                    collected_at: new Date().toISOString(),
+                }
+            }
+            throw err
+        }
+
+        const replicasDesired = service.Spec?.Mode?.Replicated?.Replicas ?? 1
+        const cpuLimitNano =
+            service.Spec?.TaskTemplate?.Resources?.Limits?.NanoCPUs ?? 0
+        const cpuLimitCores = cpuLimitNano > 0 ? cpuLimitNano / 1e9 : 0
+        const serviceMemoryLimit =
+            service.Spec?.TaskTemplate?.Resources?.Limits?.MemoryBytes ?? 0
+
+        const [tasks, nodes] = await Promise.all([
+            this.dockerode.listTasks({
+                filters: {
+                    service: [service.ID],
+                    'desired-state': ['running'],
+                },
+            }) as Promise<
+                {
+                    NodeID?: string
+                    Status?: {
+                        State?: string
+                        ContainerStatus?: { ContainerID?: string }
+                    }
+                }[]
+            >,
+            this.dockerode.listNodes().catch(() => []) as Promise<
+                {
+                    ID: string
+                    Description?: {
+                        Hostname?: string
+                        Resources?: {
+                            NanoCPUs?: number
+                            MemoryBytes?: number
+                        }
+                    }
+                }[]
+            >,
+        ])
+
+        const runningTasks = tasks.filter(
+            (task) => task.Status?.State === 'running'
+        )
+        const replicasRunning = runningTasks.length
+        const primaryTask = runningTasks.find(
+            (task) => task.Status?.ContainerStatus?.ContainerID
+        )
+        const targetNode = nodes.find((n) => n.ID === primaryTask?.NodeID) ?? nodes[0]
+        const nodeHostname = targetNode?.Description?.Hostname ?? ''
+        const hostCpuCount = targetNode?.Description?.Resources?.NanoCPUs
+            ? Math.max(
+                  1,
+                  Math.round(targetNode.Description.Resources.NanoCPUs / 1e9)
+              )
+            : 0
+        const hostMemoryBytes =
+            targetNode?.Description?.Resources?.MemoryBytes ?? 0
+
+        const containerId = primaryTask?.Status?.ContainerStatus?.ContainerID
+        if (!containerId) {
+            return {
+                available: false,
+                message:
+                    replicasRunning === 0
+                        ? 'No running container found'
+                        : 'Container ID unavailable',
+                replicas_running: replicasRunning,
+                replicas_desired: replicasDesired,
+                cpu_percent: 0,
+                online_cpus: hostCpuCount,
+                cpu_limit_cores: cpuLimitCores,
+                memory_usage_bytes: 0,
+                memory_limit_bytes: serviceMemoryLimit,
+                host_memory_bytes: hostMemoryBytes,
+                memory_percent: 0,
+                container_rw_bytes: 0,
+                container_rootfs_bytes: 0,
+                network_rx_bytes: 0,
+                network_tx_bytes: 0,
+                block_read_bytes: 0,
+                block_write_bytes: 0,
+                pids: 0,
+                restart_count: 0,
+                started_at: '',
+                node_hostname: nodeHostname,
+                collected_at: new Date().toISOString(),
+            }
+        }
+
+        try {
+            const container = this.dockerode.getContainer(containerId)
+            const [statsRaw, inspectRaw] = await Promise.all([
+                container.stats({ stream: false }) as Promise<{
+                    cpu_stats?: {
+                        cpu_usage?: {
+                            total_usage?: number
+                            percpu_usage?: number[]
+                        }
+                        system_cpu_usage?: number
+                        online_cpus?: number
+                    }
+                    precpu_stats?: {
+                        cpu_usage?: { total_usage?: number }
+                        system_cpu_usage?: number
+                    }
+                    memory_stats?: {
+                        usage?: number
+                        limit?: number
+                        stats?: {
+                            inactive_file?: number
+                            cache?: number
+                        }
+                    }
+                    networks?: Record<
+                        string,
+                        { rx_bytes?: number; tx_bytes?: number }
+                    >
+                    blkio_stats?: {
+                        io_service_bytes_recursive?: {
+                            op?: string
+                            value?: number
+                        }[]
+                    }
+                    pids_stats?: { current?: number }
+                }>,
+                (
+                    container as unknown as {
+                        inspect: (opts: { size: boolean }) => Promise<{
+                            SizeRw?: number
+                            SizeRootFs?: number
+                            RestartCount?: number
+                            State?: { StartedAt?: string }
+                        }>
+                    }
+                ).inspect({ size: true }),
+            ])
+
+            const cpuDelta =
+                (statsRaw.cpu_stats?.cpu_usage?.total_usage ?? 0) -
+                (statsRaw.precpu_stats?.cpu_usage?.total_usage ?? 0)
+            const systemDelta =
+                (statsRaw.cpu_stats?.system_cpu_usage ?? 0) -
+                (statsRaw.precpu_stats?.system_cpu_usage ?? 0)
+            const onlineCpus =
+                statsRaw.cpu_stats?.online_cpus ||
+                statsRaw.cpu_stats?.cpu_usage?.percpu_usage?.length ||
+                hostCpuCount ||
+                1
+            const cpuPercent =
+                systemDelta > 0 && cpuDelta >= 0
+                    ? Math.round((cpuDelta / systemDelta) * onlineCpus * 10000) /
+                      100
+                    : 0
+
+            const rawMemUsage = statsRaw.memory_stats?.usage ?? 0
+            const reclaimable =
+                statsRaw.memory_stats?.stats?.inactive_file ??
+                statsRaw.memory_stats?.stats?.cache ??
+                0
+            const memoryUsageBytes = Math.max(0, rawMemUsage - reclaimable)
+            const effectiveMemLimit =
+                serviceMemoryLimit > 0
+                    ? serviceMemoryLimit
+                    : statsRaw.memory_stats?.limit ?? hostMemoryBytes
+            const memoryPercent =
+                effectiveMemLimit > 0
+                    ? Math.round(
+                          (memoryUsageBytes / effectiveMemLimit) * 10000
+                      ) / 100
+                    : 0
+
+            let networkRxBytes = 0
+            let networkTxBytes = 0
+            for (const net of Object.values(statsRaw.networks ?? {})) {
+                networkRxBytes += net.rx_bytes ?? 0
+                networkTxBytes += net.tx_bytes ?? 0
+            }
+
+            let blockReadBytes = 0
+            let blockWriteBytes = 0
+            for (const entry of statsRaw.blkio_stats
+                ?.io_service_bytes_recursive ?? []) {
+                const op = (entry.op ?? '').toLowerCase()
+                if (op === 'read') blockReadBytes += entry.value ?? 0
+                if (op === 'write') blockWriteBytes += entry.value ?? 0
+            }
+
+            return {
+                available: true,
+                message: '',
+                replicas_running: replicasRunning,
+                replicas_desired: replicasDesired,
+                cpu_percent: cpuPercent,
+                online_cpus: onlineCpus,
+                cpu_limit_cores: cpuLimitCores,
+                memory_usage_bytes: memoryUsageBytes,
+                memory_limit_bytes: effectiveMemLimit,
+                host_memory_bytes: hostMemoryBytes,
+                memory_percent: memoryPercent,
+                container_rw_bytes: inspectRaw.SizeRw ?? 0,
+                container_rootfs_bytes: inspectRaw.SizeRootFs ?? 0,
+                network_rx_bytes: networkRxBytes,
+                network_tx_bytes: networkTxBytes,
+                block_read_bytes: blockReadBytes,
+                block_write_bytes: blockWriteBytes,
+                pids: statsRaw.pids_stats?.current ?? 0,
+                restart_count: inspectRaw.RestartCount ?? 0,
+                started_at: inspectRaw.State?.StartedAt ?? '',
+                node_hostname: nodeHostname,
+                collected_at: new Date().toISOString(),
+            }
+        } catch (err) {
+            return {
+                available: false,
+                message:
+                    err instanceof Error
+                        ? err.message
+                        : 'Unable to inspect container metrics',
+                replicas_running: replicasRunning,
+                replicas_desired: replicasDesired,
+                cpu_percent: 0,
+                online_cpus: hostCpuCount,
+                cpu_limit_cores: cpuLimitCores,
+                memory_usage_bytes: 0,
+                memory_limit_bytes: serviceMemoryLimit,
+                host_memory_bytes: hostMemoryBytes,
+                memory_percent: 0,
+                container_rw_bytes: 0,
+                container_rootfs_bytes: 0,
+                network_rx_bytes: 0,
+                network_tx_bytes: 0,
+                block_read_bytes: 0,
+                block_write_bytes: 0,
+                pids: 0,
+                restart_count: 0,
+                started_at: '',
+                node_hostname: nodeHostname,
+                collected_at: new Date().toISOString(),
+            }
+        }
+    }
+
     async getVolumeUsage() {
         const usage: {
             Volumes?: {

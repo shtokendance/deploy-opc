@@ -1177,6 +1177,26 @@ class ServiceManager {
             })
     }
 
+    async getAppResourceMetrics(appName: string) {
+        const appsDataStore = this.dataStore.getAppsDataStore()
+        const apps = await appsDataStore.getAppDefinitions()
+        if (!Object.prototype.hasOwnProperty.call(apps, appName)) {
+            throw ApiStatusCodes.createError(
+                ApiStatusCodes.NOT_FOUND,
+                'App not found'
+            )
+        }
+        const app = apps[appName]
+        const serviceName = appsDataStore.getServiceName(
+            appName,
+            !!app.isLegacyAppName
+        )
+        const metrics = await this.dockerApi.getServiceResourceMetrics(
+            serviceName
+        )
+        return { appName, ...metrics }
+    }
+
     async setApplicationWriteHold(appName: string, hold: boolean) {
         if (this.isAppBuilding(appName)) {
             throw new Error(

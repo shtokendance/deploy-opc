@@ -27,6 +27,26 @@ router.get('/', function (req, res, next) {
         .catch(ApiStatusCodes.createCatcher(res))
 })
 
+router.get('/:appName/metrics', function (req, res) {
+    const serviceManager =
+        InjectionExtractor.extractUserFromInjected(res).user.serviceManager
+    const appName = req.params.appName
+
+    return Promise.resolve()
+        .then(function () {
+            return serviceManager.getAppResourceMetrics(appName)
+        })
+        .then(function (data) {
+            const baseApi = new BaseApi(
+                ApiStatusCodes.STATUS_OK,
+                'App resource metrics retrieved.'
+            )
+            baseApi.data = data
+            res.send(baseApi)
+        })
+        .catch(ApiStatusCodes.createCatcher(res))
+})
+
 router.get('/:appName', function (req, res, next) {
     const serviceManager =
         InjectionExtractor.extractUserFromInjected(res).user.serviceManager
